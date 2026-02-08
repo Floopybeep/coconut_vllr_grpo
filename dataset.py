@@ -17,7 +17,9 @@ from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 def get_dataset(path, tokenizer, max_size=1000000000):
 
     def tokenize_sample(sample):
-
+        """
+        Packs dataset into a dict, with questions/steps/answer/idx keys and tokenized values 
+        """
         question_tokenized = tokenizer.encode(
             sample["question"] + "\n", add_special_tokens=True
         )
@@ -41,6 +43,7 @@ def get_dataset(path, tokenizer, max_size=1000000000):
     data = [{**d, "idx": idx} for idx, d in enumerate(data)]
 
     keys = data[0].keys()
+    # keys = sorted(keys)[:32]
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
 
     if torch.cuda.device_count() > 1:
@@ -227,56 +230,64 @@ def get_question_latent_dataset(
     )
 
 
-def get_cot_latent_dataset(
-    scheduled_stage,
-    base_dataset,
-    configs,
-    start_id,
-    latent_id,
-    end_id,
-    no_special_marker=False,
-    shuffle=False,
-):
+class CotLatentDataset(torch.utils.data.Dataset):
+    """Lazy dataset wrapper that applies CoT-to-latent transformation on-the-fly.
 
-    n_additional_tokens = 0 if no_special_marker else 2
+    Change 6: Replaces the expensive .map() materialization that was called every epoch.
+    The stochastic stage selection (uniform_prob) is applied fresh each __getitem__ call,
+    providing better randomization diversity across epochs without the O(N) .map() cost.
+    Shuffling is handled by the DataLoader's DistributedSampler, not the dataset itself.
+    """
 
-    def process_dataset(sample):
+    def __init__(self, base_dataset, scheduled_stage, configs, start_id, latent_id, end_id,
+                 no_special_marker=False):
+        self.base_dataset = base_dataset
+        self.scheduled_stage = scheduled_stage
+        self.configs = configs
+        self.start_id = start_id
+        self.latent_id = latent_id
+        self.end_id = end_id
+        self.no_special_marker = no_special_marker
+        self.n_additional_tokens = 0 if no_special_marker else 2
 
-        if (
-            random.random() < configs.uniform_prob
-        ):  # with some prob, randomly sample stage
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        sample = self.base_dataset[idx]
+
+        if random.random() < self.configs.uniform_prob:
             scheduled_stage_to_train = random.choice(
                 list(range(len(sample["steps_tokenized"]) + 1))
             )
         else:
-            scheduled_stage_to_train = scheduled_stage
+            scheduled_stage_to_train = self.scheduled_stage
 
-        if scheduled_stage_to_train > configs.max_latent_stage:
+        if scheduled_stage_to_train > self.configs.max_latent_stage:
             n_skip_steps = 10000  # skip all
-            if configs.pad_latent_to_max:
-                n_latent_tokens = configs.max_latent_stage
+            if self.configs.pad_latent_to_max:
+                n_latent_tokens = self.configs.max_latent_stage
             else:
                 n_latent_tokens = min(
-                    len(sample["steps_tokenized"]), configs.max_latent_stage
+                    len(sample["steps_tokenized"]), self.configs.max_latent_stage
                 )
-
         else:
             n_skip_steps, n_latent_tokens = (
                 scheduled_stage_to_train,
                 scheduled_stage_to_train,
             )
 
-        if configs.no_cot:
+        if self.configs.no_cot:
             n_skip_steps = 100  # skip all step
             n_latent_tokens = 0
 
-        n_latent_tokens *= configs.c_thought
+        n_latent_tokens *= self.configs.c_thought
 
         tokens = (
             sample["question_tokenized"]
-            + ([] if no_special_marker else [start_id])
-            + [latent_id] * n_latent_tokens
-            + ([] if no_special_marker else [end_id])
+            + ([] if self.no_special_marker else [self.start_id])
+            + [self.latent_id] * n_latent_tokens
+            + ([] if self.no_special_marker else [self.end_id])
             + list(
                 itertools.chain.from_iterable(sample["steps_tokenized"][n_skip_steps:])
             )
@@ -289,11 +300,11 @@ def get_cot_latent_dataset(
             * (
                 len(sample["question_tokenized"])
                 + n_latent_tokens
-                + n_additional_tokens
+                + self.n_additional_tokens
             )
             + tokens[
                 n_latent_tokens
-                + n_additional_tokens
+                + self.n_additional_tokens
                 + len(sample["question_tokenized"]) :
             ],
             "attention_mask": [1] * len(tokens),
@@ -301,25 +312,19 @@ def get_cot_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
-    if torch.cuda.device_count() > 1:
-        if dist.get_rank() == 0:
-            processed_dataset = base_dataset.map(
-                process_dataset, remove_columns=list(base_dataset.features), num_proc=32
-            )
-            if shuffle:
-                processed_dataset = processed_dataset.shuffle()
-            processed_dataset = [processed_dataset]
-        else:
-            processed_dataset = [None]
-        dist.broadcast_object_list(processed_dataset, src=0)
-        dataset = processed_dataset[0]
 
-    else:
-        processed_dataset = base_dataset.map(
-            process_dataset, remove_columns=list(base_dataset.features), num_proc=32
-        )
-        if shuffle:
-            processed_dataset = processed_dataset.shuffle()
-        dataset = processed_dataset
-
-    return dataset
+def get_cot_latent_dataset(
+    scheduled_stage,
+    base_dataset,
+    configs,
+    start_id,
+    latent_id,
+    end_id,
+    no_special_marker=False,
+    shuffle=False,  # shuffle is now handled by DataLoader/DistributedSampler, kept for API compat
+):
+    return CotLatentDataset(
+        base_dataset, scheduled_stage, configs,
+        start_id, latent_id, end_id,
+        no_special_marker=no_special_marker,
+    )

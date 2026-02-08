@@ -1,7 +1,7 @@
 # need 4 gpus
 
 project: coconut
-save_path: YOUR_PATH_TO_SAVE_THE_MODEL
+save_path: checkpoints
 name: gsm-cot
 
 only_eval: False

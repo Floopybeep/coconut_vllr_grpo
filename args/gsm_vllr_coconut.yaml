@@ -1,0 +1,40 @@
+# need 4 gpus
+
+project: coconut
+save_path: checkpoints
+name: gsm-coconut-VLLR4-5epochs_stage
+
+only_eval: False
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 2
+epochs_per_stage: 5
+max_latent_stage: 6
+pad_latent_to_max: True
+termination_gamma: 1
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+# load_model_path: checkpoints/gsm-cot-VLLR/checkpoint_5
+load_model_path: checkpoints/gsm-coconut-VLLR4-5epochs_stage/checkpoint_7     # starts counting at 1
+
+resume: 10     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.
+reset_optimizer: True
+num_epochs: 30
+batch_size_training: 4
+gradient_accumulation_steps: 8
+lr: !!float "2.5e-5"
+weight_decay: 0.01
+uniform_prob: 0.0
+seed: 42
+
+sdpa_attention: True
+grad_checkpointing: False

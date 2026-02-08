@@ -1,6 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+import os, sys
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+
 import torch
 import torch.distributed
 import torch.optim as optim
@@ -24,20 +28,64 @@ from dataset import (
     MyCollator,
 )
 
-from tqdm import tqdm
-from copy import copy
-import itertools
-import os, sys
+import gc
 import yaml
 import json
-import gc
+import datetime
 import argparse
+import itertools
 import functools
+import bitsandbytes as bnb
+from tqdm import tqdm
+from copy import copy
 from utils import Config, set_seed
+
+import torch
+
+def print_memory_breakdown(model, optimizer):
+    """
+    Prints a breakdown of memory usage by Model Weights, Grads, and Optimizer States.
+    """
+    # 1. Model Weights
+    param_mem = 0
+    grad_mem = 0
+    for param in model.parameters():
+        param_mem += param.numel() * param.element_size()
+        if param.grad is not None:
+            grad_mem += param.grad.numel() * param.grad.element_size()
+            
+    # 2. Optimizer States
+    opt_mem = 0
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                opt_mem += v.numel() * v.element_size()
+                
+    # 3. Totals
+    total_allocated = torch.cuda.memory_allocated()
+    # Activations is roughly the difference, though it includes temp buffers
+    activations_and_buffers = total_allocated - (param_mem + grad_mem + opt_mem)
+
+    # Convert to GB
+    to_gb = 1024**3
+    
+    print(f"--- VRAM Breakdown ---")
+    print(f"Model Weights:    {param_mem / to_gb:.2f} GB")
+    print(f"Gradients:        {grad_mem / to_gb:.2f} GB")
+    print(f"Optimizer States: {opt_mem / to_gb:.2f} GB")
+    print(f"Activations/Misc: {activations_and_buffers / to_gb:.2f} GB")
+    print(f"----------------------")
+    print(f"Total Allocated:  {total_allocated / to_gb:.2f} GB")
+    print(f"Max Reserved:     {torch.cuda.max_memory_reserved() / to_gb:.2f} GB")
+    print(f"Max Allocated:    {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+
+# Usage: Call this inside your training loop after optimizer.step()
+# print_memory_breakdown(model, optimizer)
 
 
 def main():
 
+    # Init ####################################################################################################################
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
     args = parser.parse_args()
@@ -66,9 +114,11 @@ def main():
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
 
-    # check if the job is preempted and resumed.
+    current_time = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
 
-    if len(cur_ckpts) > 0 and not configs.only_eval:
+    # Check if resume ##########################################################################################################
+    # check if the job is preempted and resumed.
+    if len([f for f in cur_ckpts if not f.endswith("txt")]) > 0 and not configs.only_eval and configs.resume == 0:      # configured to ignore txt logs
         # if there are previous checkpoints, and only_eval is False
         # it means the previous run was preempted and the program is restarted.
         # need to find the latest checkpoint and resume from that.
@@ -100,7 +150,16 @@ def main():
             f"Loading from {configs.load_model_path} and skip the first {configs.resume} epochs"
         )
 
-    model = AutoModelForCausalLM.from_pretrained(configs.model_id)
+    # Define model & things ####################################################################################################
+    if configs.sdpa_attention:
+        if configs.bf16:
+            model = AutoModelForCausalLM.from_pretrained(configs.model_id, attn_implementation="sdpa", torch_dtype=torch.bfloat16)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(configs.model_id, attn_implementation="sdpa")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(configs.model_id)
+    if configs.grad_checkpointing:
+        model.gradient_checkpointing_enable()
     tokenizer = AutoTokenizer.from_pretrained(configs.model_id)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_tokens("<|start-latent|>")
@@ -113,9 +172,11 @@ def main():
     loaded = False
 
     if configs.load_model_path != "None":
-        saved_weights = torch.load(
-            configs.load_model_path, map_location=torch.device(rank)
-        )
+        # saved_checkpoint = torch.load(
+        #     configs.load_model_path, map_location=torch.device(rank)
+        # )
+        # saved_weights = saved_checkpoint["model_state_dict"]
+        saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
 
         if configs.coconut and not any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
@@ -161,7 +222,7 @@ def main():
         configs.coconut = False
 
     if configs.coconut:
-        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
+        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -186,7 +247,7 @@ def main():
 
     else:
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank, use_orig_params=True
         )
 
     del model
@@ -207,7 +268,7 @@ def main():
 
     if not configs.only_eval:
         base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=5000 if configs.debug else 100000000
+            configs.train_path, tokenizer, max_size=3200 if configs.debug else 100000000
         )
 
     if "gsm" in configs.val_path:
@@ -229,7 +290,10 @@ def main():
         optimizer = None
 
     else:
-        optimizer = optim.AdamW(
+        # if configs.resume != 0:
+        #     optimizer = bnb.optim.Adam8bit.load_state_dict(saved_checkpoint["optimizer_state_dict"])
+        # else:
+        optimizer = bnb.optim.Adam8bit(
             parallel_model.parameters(),
             lr=configs.lr,
             weight_decay=configs.weight_decay,
@@ -244,6 +308,19 @@ def main():
         scheduled_stage = (
             0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
         )
+
+        # Remove old datasets
+        if 'train_dataloader' in locals():
+            del train_dataloader
+        if 'dataset_train' in locals():
+            del dataset_train
+        if 'valid_gen_dataloader' in locals():
+            del valid_gen_dataloader
+        if 'dataset_gen_val' in locals():
+            del dataset_gen_val
+        gc.collect()
+
+        # Load validation dataset
         dataset_gen_val = get_question_latent_dataset(
             scheduled_stage,
             base_dataset_valid,
@@ -263,6 +340,7 @@ def main():
             sampler=DistributedSampler(dataset_gen_val, shuffle=False),
         )
 
+        # Load training dataset
         if not configs.only_eval:
 
             dataset_train = get_cot_latent_dataset(
@@ -309,15 +387,21 @@ def main():
                 sampler=DistributedSampler(dataset_loss_val, shuffle=False),
             )
 
-            if configs.reset_optimizer:
+            if configs.reset_optimizer or epoch % configs.epochs_per_stage == 0:
                 del optimizer
 
-                optimizer = optim.AdamW(
+                # optimizer = optim.AdamW(
+                #     parallel_model.parameters(),
+                #     lr=configs.lr,
+                #     weight_decay=configs.weight_decay,
+                # )
+                optimizer = bnb.optim.Adam8bit(
                     parallel_model.parameters(),
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
                 )
 
+            # Begin training #####################################################################################3
             parallel_model.module.train()
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
@@ -328,12 +412,14 @@ def main():
                 dynamic_ncols=True,
             )
 
-            for step, batch in enumerate(train_dataloader):
+            current_table = wandb.Table(columns=["step", "text"]) 
+            for step, batch in enumerate(train_dataloader):     # batch = batch of dicts(["question", "steps", "answer", "idx"])
 
                 if step == 0 and wandb_run and rank == 0:
                     print("logging training data")
-                    cur_bs = len(batch["input_ids"])
+                    cur_bs = len(batch["input_ids"])        # batch_size
                     text_str = ""
+
                     for data_idx in range(cur_bs):
                         for token_idx in range(len(batch["input_ids"][data_idx])):
                             text_str += (
@@ -347,17 +433,25 @@ def main():
                                 + "\n"
                             )
                         text_str += "====" * 10 + "\n"
-                    text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
+                    current_table.add_data(total_train_steps, text_str)
 
-                    wandb_run.log({"data_table": copy(text_table)})
+                    # ... populate current_table ...
+
+                    # text_table.add_data(total_train_steps, text_str)
+                    # # copy the table due to a bug in wandb
+                    # # https://github.com/wandb/wandb/issues/2981
+
+                    # wandb_run.log({"data_table": copy(text_table)})
 
                 total_train_steps += 1
                 batch = {
-                    key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                    key: batch[key].to(rank) for key in batch.keys() if key != "idx"        # set tokenized text to device(the GPU that current code runs in - multi-GPU setting)
                 }
+                if step == 0 and wandb_run and rank == 0:      # Change 5: only log data_table once at step 0, not every step
+                    wandb_run.log({"data_table": current_table})
 
+                # print(batch.keys())
+                # print(batch["attention_mask"])
                 outputs = parallel_model(**batch)
 
                 loss = outputs.loss / configs.gradient_accumulation_steps
@@ -370,12 +464,17 @@ def main():
                     optimizer.zero_grad()
                     pbar.update(1)
 
+                if step == 100:
+                    print_memory_breakdown(parallel_model, optimizer)     # use to check if batch_size can be increased
+
                 if wandb_run and rank == 0:
                     log_dict = {
                         "train/epoch": epoch + 1,
                         "train/step": epoch * len(train_dataloader) + step,
-                        "train/loss": loss.detach().float()
-                        * configs.gradient_accumulation_steps,
+                        # "train/loss": loss.detach().float() * configs.gradient_accumulation_steps,
+                        "train/loss": loss.item() * configs.gradient_accumulation_steps,
+                        "train/acc": torch.sum(torch.argmax(outputs.logits, dim=-1) == batch["input_ids"]).item() / (outputs.logits.shape[0] * outputs.logits.shape[1]),
+                        "train/term_acc": torch.sum(torch.argmax(outputs.termination_logits, dim=-1) == outputs.termination_labels).item() / (outputs.logits.shape[0] * outputs.logits.shape[1])
                     }
                     wandb_run.log(log_dict)
 
@@ -386,6 +485,7 @@ def main():
             pbar.close()
             dist.barrier()
 
+            # Save model after checkpoint
             if (
                 not configs.save_only_improve
                 and not configs.debug
@@ -403,6 +503,7 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
+            # Validation step #######################################################################################
             # val loss
             total_loss = 0
 
@@ -420,16 +521,16 @@ def main():
                     total_loss += loss.item() / world_size
 
                 if wandb_run and rank == 0:
-
                     log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
+                        "val/loss": total_loss / len(valid_loss_dataloader),
                     }
                     wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                    print("validation loss", total_loss / len(valid_loss_dataloader))
 
         # val generation accuracy
         total_length = len(valid_gen_dataloader)
 
+        # Evaluation step #################################################################################################
         pbar = tqdm(
             colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
         )
@@ -441,6 +542,7 @@ def main():
 
         with torch.no_grad():
             parallel_model.module.eval()
+            eval_savepath = os.path.join(save_dir, f"checkpoint_{epoch + 1}_evaluation_{current_time}.txt")
             for idx, batch in enumerate(valid_gen_dataloader):
                 test_idx = batch["idx"][0]
 
@@ -486,6 +588,14 @@ def main():
                 pbar.set_description(
                     f"Test accuracy: {round(float(cor.detach().float() / total.detach().float()), 2)}"
                 )
+                
+                if rank == 0:
+                    with open(eval_savepath, "a+") as fp:
+                        fp.write(f"\nQuestion {test_idx+1}:\nCoT = {answer_cot}\n")
+                        fp.write(f"Full output:\n{tokenizer.decode(outputs[0])}\n")
+                        fp.write(f"Extracted Output:\n{answer_output}\n")
+                        fp.write(f"Answer = {answer}\n")
+                        fp.write("-" * 30)
 
             pbar.close()
             print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
@@ -515,10 +625,15 @@ def main():
             and not configs.debug
             and not configs.only_eval
         ):
-            states = parallel_model.state_dict()
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": parallel_model.state_dict(),
+                "optimimzer_state_dict": optimizer.state_dict()
+            }
+            # states = parallel_model.state_dict()
 
             if rank == 0:
-                torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
+                torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt"))
                 print("saving model.")
 
             best_acc = cor / total

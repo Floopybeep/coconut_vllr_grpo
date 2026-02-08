@@ -1,0 +1,82 @@
+2026/01/29
+CHANGE: 
+ - Added termination_latent_head in coconut.py
+ - Added train-time termination head label generation (currently uses input for label generation, maybe should change to input + output?)
+ - Switched LLM model base to Qwen3-0.6B
+
+RUN: COCONUT SFT initially!
+ - Batch size 1, effective batch size 32 (like coconut)
+ - Had to run with bfloat16 due to VRAM requirements
+
+ - CURRENTLY: training Qwen2.5-1.5B on GSM8k
+
+TODO: 
+ - Implement batched GRPO for efficient & fast RL
+ - Compare SFT gsm8k on QLoRA SFT gsm8k, check if QLoRA is a viable alternative
+
+
+
+2026/02/02
+CHANGE:
+  - Added termination head accuracy calculation
+
+RUN: COCONUT VLLR SFT C=1 start!
+ - Batch size 1, effective batch size 32
+ - bfloat16
+
+
+2026/02/04
+CHANGE:
+  - changed optimizer to 8bit optim from bitsandbytes
+  - changed base model attention to sdpa attention
+  - changed batch size from 1 -> 8
+  - added evaluation logs
+
+RUN: COCONUT VLLR-2 SFT C=1 start
+  - batch size 8, effective batch size 32
+  - bfloat16, 8bitAdam, sdpa attention
+
+PROBLEMS:
+  - case of diverging to nan loss during training     -> fixed by changing nn.Embedding to StableEmbedding
+  - loss increase, val accuracy decrease              -> attempting fix by reducing learning rate by half (original settings: 32 batch size @ 1e-4 lr = 8 batch size @ 5e-5 (reduce by factor of sqrt(dim_change))
+
+NOTE:
+  - validation loss was incorrectly labeled as eval loss
+    - means previous eval loss is not necessarily related to eval accuracy -> eval accuracy is the only metric I need to care about
+
+2026/02/06
+CHANGE:
+  - reduced learning rate to accomodate batch size change:   1e-4 -> 5e-5
+  - changed eval/loss -> val/loss
+
+RUN: COCONUT VLLR-3 SFT C=1 start
+
+NOTE:
+  - cot_em is completely broken, I identified steps in checkpoint_5_eval that had perfectly fine cot steps but reported 0 cot_em
+  - as of epoch 4, looks promising
+
+IMPORTANT:
+  - eval logs reveal that even when SFT trained on C=1, the model begins to use 2 latent steps pretty successfully already???
+
+IDEA:
+  - change loss calculation to include only the labels after the latent reasoning steps?
+    - reasoning: would encourage latent steps and focus less on the formatting, i.e. the number of tokens in total
+
+2026/02/07
+CHANGE:
+  - added optimizer reset every time latent step number increases (as was stated in the fucking paper)
+  - 
+
+RUN: COCONUT VLLR-3 SFT C=1 restarted
+
+NOTE:
+  - previous C=1 epoch 1 ckpt is lost, due to name overlap.
+  - restarted from checkpoint_5, which is C=0
+  - previous run crashed from lack of VRAM, may have to reduce batch size to 4
+
+  - Added PYTORCH_NO_CUDA_MEMORY_CACHING to reduce VRAM usage in cache, but not yet reflected in current training run. Possible source of error AND/OR VRAM optimization, must check and see
+    - DO NOT do this, it increases training time x4!!!
+
+TODO:
+  - make training code more efficient, currently it takes 2 hrs + 1/c_step per epoch
+  - try to run LoRA-separated version on UCSD cluster, for possible submission?
