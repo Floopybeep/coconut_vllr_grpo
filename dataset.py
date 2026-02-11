@@ -223,6 +223,7 @@ def get_question_latent_dataset(
             "idx": sample["idx"],
             "attention_mask": [1] * len(tokens),
             "position_ids": list(range(len(tokens))),
+            "latent_tokens": k,
         }
 
     return base_dataset_valid.map(
@@ -258,7 +259,7 @@ class CotLatentDataset(torch.utils.data.Dataset):
 
         if random.random() < self.configs.uniform_prob:
             scheduled_stage_to_train = random.choice(
-                list(range(len(sample["steps_tokenized"]) + 1))
+                list(range(1, len(sample["steps_tokenized"]) + 1))
             )
         else:
             scheduled_stage_to_train = self.scheduled_stage
@@ -281,7 +282,8 @@ class CotLatentDataset(torch.utils.data.Dataset):
             n_skip_steps = 100  # skip all step
             n_latent_tokens = 0
 
-        n_latent_tokens *= self.configs.c_thought
+        # n_latent_tokens *= self.configs.c_thought                 # change
+        n_latent_tokens *= random.choice(list(range(1, self.configs.c_thought + 1)))
 
         tokens = (
             sample["question_tokenized"]
@@ -310,6 +312,7 @@ class CotLatentDataset(torch.utils.data.Dataset):
             "attention_mask": [1] * len(tokens),
             "idx": sample["idx"],
             "position_ids": list(range(len(tokens))),
+            "latent_tokens": n_latent_tokens,
         }
 
 

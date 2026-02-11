@@ -1,6 +1,6 @@
 # need 4 gpus
 
-project: coconut
+project: coconut-VLLR-mixedc
 save_path: checkpoints
 name: gsm-coconut-VLLR5-mixedc-nostartmarker
 
@@ -25,10 +25,10 @@ model_id: Qwen/Qwen2.5-1.5B
 train_path: data/gsm_train.json
 val_path: data/gsm_valid.json
 # load_model_path: checkpoints/gsm-cot-VLLR/checkpoint_5
-load_model_path: checkpoints/gsm-coconut-VLLR4-5epochs_stage/checkpoint_10     # starts counting at 1
+load_model_path: checkpoints/gsm-coconut-VLLR5-mixedc-nostartmarker/checkpoint_2_260210_122025.pt     # starts counting at 1
 
-resume: 0     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.     # resume at 13 next time
-reset_optimizer: True
+resume: 2     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.     # resume at 13 next time
+reset_optimizer: False
 num_epochs: 10
 batch_size_training: 4
 gradient_accumulation_steps: 8

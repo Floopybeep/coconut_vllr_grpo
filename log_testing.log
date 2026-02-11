@@ -80,3 +80,14 @@ NOTE:
 TODO:
   - make training code more efficient, currently it takes 2 hrs + 1/c_step per epoch
   - try to run LoRA-separated version on UCSD cluster, for possible submission?
+
+2026/02/10
+CHANGE:
+  - fixed termination head accuracy calculation
+  - changed generation logic so that the first token is also screened for latent or not
+
+RUN(NEW):
+  - coconut training was taking too long, so started a new conceptual run for POC
+  - new run: remove <start-latent> and <end-latent>, and remove curriculum training for mixed-c training
+  - mixed-c: number of steps to be replaced is 100% randomized, and number of latent tokens per step is also randomized to [1, 6]
+    - on eval, a variable number of latent tokens/step was found

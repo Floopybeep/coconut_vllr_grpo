@@ -172,11 +172,11 @@ def main():
     loaded = False
 
     if configs.load_model_path != "None":
-        # saved_checkpoint = torch.load(
-        #     configs.load_model_path, map_location=torch.device(rank)
-        # )
-        # saved_weights = saved_checkpoint["model_state_dict"]
-        saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
+        saved_checkpoint = torch.load(
+            configs.load_model_path, map_location=torch.device(rank)
+        )
+        saved_weights = saved_checkpoint["model_state_dict"]
+        # saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
 
         if configs.coconut and not any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
@@ -272,7 +272,8 @@ def main():
         )
 
     if "gsm" in configs.val_path:
-        max_new_tokens = 64
+        # max_new_tokens = 64                   # change
+        max_new_tokens = 128
     else:
         max_new_tokens = 128
 
@@ -318,6 +319,10 @@ def main():
             del valid_gen_dataloader
         if 'dataset_gen_val' in locals():
             del dataset_gen_val
+        if 'valid_loss_dataloader' in locals():
+            del valid_loss_dataloader
+        if 'dataset_loss_val' in locals():
+            del dataset_loss_val
         gc.collect()
 
         # Load validation dataset
@@ -328,7 +333,7 @@ def main():
             start_id,
             latent_id,
             end_id,
-            no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+            no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts or configs.no_bot_tokens,
         )
 
         valid_gen_dataloader = torch.utils.data.DataLoader(
@@ -350,7 +355,7 @@ def main():
                 start_id,
                 latent_id,
                 end_id,
-                no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+                no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts or configs.no_bot_tokens,
                 shuffle=True,
             )
 
@@ -374,7 +379,7 @@ def main():
                 start_id,
                 latent_id,
                 end_id,
-                no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+                no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts or configs.no_bot_tokens,
             )
 
             valid_loss_dataloader = torch.utils.data.DataLoader(
@@ -412,10 +417,10 @@ def main():
                 dynamic_ncols=True,
             )
 
-            current_table = wandb.Table(columns=["step", "text"]) 
             for step, batch in enumerate(train_dataloader):     # batch = batch of dicts(["question", "steps", "answer", "idx"])
 
                 if step == 0 and wandb_run and rank == 0:
+                    current_table = wandb.Table(columns=["step", "text"]) 
                     print("logging training data")
                     cur_bs = len(batch["input_ids"])        # batch_size
                     text_str = ""
@@ -434,8 +439,8 @@ def main():
                             )
                         text_str += "====" * 10 + "\n"
                     current_table.add_data(total_train_steps, text_str)
-
-                    # ... populate current_table ...
+                    wandb_run.log({"data_table": current_table})
+                    del current_table
 
                     # text_table.add_data(total_train_steps, text_str)
                     # # copy the table due to a bug in wandb
@@ -447,8 +452,6 @@ def main():
                 batch = {
                     key: batch[key].to(rank) for key in batch.keys() if key != "idx"        # set tokenized text to device(the GPU that current code runs in - multi-GPU setting)
                 }
-                if step == 0 and wandb_run and rank == 0:      # Change 5: only log data_table once at step 0, not every step
-                    wandb_run.log({"data_table": current_table})
 
                 # print(batch.keys())
                 # print(batch["attention_mask"])
@@ -456,6 +459,8 @@ def main():
 
                 loss = outputs.loss / configs.gradient_accumulation_steps
                 loss.backward()
+
+                # B, L = outputs.loss.shape[0], outputs.loss.shape[1]
 
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
@@ -465,7 +470,15 @@ def main():
                     pbar.update(1)
 
                 if step == 100:
-                    print_memory_breakdown(parallel_model, optimizer)     # use to check if batch_size can be increased
+                    print_memory_breakdown(parallel_model, optimizer)     # use to check how much VRAM is being used
+
+                term_mask = outputs.termination_labels == 1
+                term_correct = (torch.argmax(outputs.termination_logits, dim=-1) == outputs.termination_labels) & term_mask
+                # print(term_mask.shape)
+                # print(term_mask)
+                # print(term_correct)
+                # print(outputs.termination_labels)
+                # print(f"{torch.sum(term_correct).item() / torch.sum(term_mask).item(): .2%}")
 
                 if wandb_run and rank == 0:
                     log_dict = {
@@ -473,8 +486,8 @@ def main():
                         "train/step": epoch * len(train_dataloader) + step,
                         # "train/loss": loss.detach().float() * configs.gradient_accumulation_steps,
                         "train/loss": loss.item() * configs.gradient_accumulation_steps,
-                        "train/acc": torch.sum(torch.argmax(outputs.logits, dim=-1) == batch["input_ids"]).item() / (outputs.logits.shape[0] * outputs.logits.shape[1]),
-                        "train/term_acc": torch.sum(torch.argmax(outputs.termination_logits, dim=-1) == outputs.termination_labels).item() / (outputs.logits.shape[0] * outputs.logits.shape[1])
+                        "train/acc": torch.sum(torch.argmax(outputs.logits, dim=-1) == batch["input_ids"]).item() / (cur_bs * len(batch["input_ids"][0])),
+                        "train/term_acc": torch.sum(term_correct).item() / torch.sum(term_mask).item()
                     }
                     wandb_run.log(log_dict)
 
@@ -491,15 +504,25 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state_dict": parallel_model.state_dict(),
+                    "optimimzer_state_dict": optimizer.state_dict()
+                }
                 if rank == 0:
-                    torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
-                    )
+                    torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt"))
                     print("saving model.")
 
+                # states = parallel_model.state_dict()
+                # if rank == 0:
+                #     torch.save(
+                #         states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
+                #     )
+                #     print("saving model.")
+                # del states
+
                 dist.barrier()
-                del states
+                del checkpoint
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -567,7 +590,7 @@ def main():
                     synced_gpus=not configs.only_eval,
                 )
 
-                text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                text_output = tokenizer.decode(outputs[0], skip_special_tokens=False)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
                 cot_output = (
                     ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()

@@ -8,7 +8,7 @@ from torch.nn import CrossEntropyLoss
 from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits", "termination_logits","termination_labels"])
+Outputs = namedtuple("Outputs", ["loss", "output_embeds", "inputs_embeds", "logits", "termination_logits","termination_labels"])
 MAX_N_LATENT = 8
 
 
@@ -221,7 +221,7 @@ class Coconut(nn.Module):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             ) + loss_fct(termination_logits.view(-1, 2), termination_labels.view(-1)) * self.termination_gamma
 
-            return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits, termination_logits=termination_logits, termination_labels=termination_labels)
+            return Outputs(loss=loss, inputs_embeds=inputs_embeds, output_embeds=hidden_states_total, logits=logits, termination_logits=termination_logits, termination_labels=termination_labels)
 
         else:           # Only for generation
             # Use _forward_base to avoid output_hidden_states=True (Change 4)
@@ -230,7 +230,7 @@ class Coconut(nn.Module):
             self.kv_cache = kv_cache
 
             termination_logits = self.latent_termination_head(hidden_states)
-            return Outputs(loss=None, inputs_embeds=input_embeds, logits=logits,
+            return Outputs(loss=None, output_embeds=hidden_states, inputs_embeds=input_embeds, logits=logits,
                         termination_logits=termination_logits, termination_labels=None)
 
 
@@ -269,12 +269,22 @@ class Coconut(nn.Module):
         )
         inputs_embeds = outputs.inputs_embeds
 
-        # get the first token using the current hidden state
-        next_token = torch.argmax(outputs.logits[0, -1]).item()
+        # Decide whether first token is latent or not
+        latent_decision = torch.argmax(outputs.termination_logits[0, -1]).item()
+
+        if latent_decision == 1:        # Latent mode
+            next_token = self.latent_token_id
+            new_token_embed = outputs.output_embeds[0, -1].view(1, 1, -1)
+
+        else:                           # Non-latent mode
+            next_token = torch.argmax(outputs.logits[0, -1]).item()
+            # if next_token == self.eos_token_id:                           # does this need an edge case? Probably not...
+            #     break
+            new_token_embed = self.embedding(
+                torch.tensor(next_token, device=input_ids.device)
+            ).view(1, 1, -1)
+
         tokens.append(next_token)
-        new_token_embed = self.embedding(
-            torch.tensor(next_token, device=input_ids.device)
-        ).view(1, 1, -1)
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
 
         # get other tokens
@@ -282,12 +292,12 @@ class Coconut(nn.Module):
             outputs = self.forward(input_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
 
-            # Decide whether current token is latent or not
+            # Decide whether NEXT token is latent or not
             latent_decision = torch.argmax(outputs.termination_logits[0, -1]).item()
 
             if latent_decision == 1:        # Latent mode
                 next_token = self.latent_token_id
-                new_token_embed = outputs.logits[0, -1]
+                new_token_embed = outputs.output_embeds[0, -1].view(1, 1, -1)
 
             else:                           # Non-latent mode
                 next_token = torch.argmax(outputs.logits[0, -1]).item()
@@ -296,8 +306,8 @@ class Coconut(nn.Module):
                 new_token_embed = self.embedding(
                     torch.tensor(next_token, device=input_ids.device)
                 ).view(1, 1, -1)
-            tokens.append(next_token)
             # print(new_inputs_embeds.shape, new_token_embed.shape)
+            tokens.append(next_token)
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
 
         if synced_gpus:
