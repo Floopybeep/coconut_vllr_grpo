@@ -1,0 +1,92 @@
+# GRPO fine-tuning of a pre-trained Coconut model on GSM8K.
+#
+# The model is given only the raw question as the prompt.  It generates its
+# own variable-length latent chain (controlled by the termination head) and
+# then the text answer.  No pre-specified latent schedule is used.
+#
+# Reward = 0.5 × correctness  +  0.5 × latent_efficiency
+# where latent_efficiency = max(0, 1 − 0.01 × max(0, n_latent − 1))
+
+# torchrun --nnodes 1 --nproc_per_node 1 run_grpo_tfhead_baseline.py args/gsm_vllr_grpo_coconut_tfhead.yaml
+# torchrun --nnodes 1 --nproc_per_node 1 run_grpo_tfhead.py args/gsm_vllr_grpo_coconut_tfhead.yaml
+
+project: coconut-grpo-tfhead
+save_path: checkpoints
+# name: gsm-coconut-grpo-tfhead-baseline
+name: gsm-coconut-grpo-tfhead-grpo
+
+only_eval: False
+# only_eval: True
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+no_bot_tokens: True
+
+termination_gamma: 1.0
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+# train_path: data/gsm_train.json
+train_path: data/openr1_train.json                # changed dataset to measure performance better?
+# train_path: data/gsm_train_original.json        # changed to original because 400k is too many training data, now using only 8k
+# val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
+val_path: data/gsm_valid.json
+
+save_pca_figures: True
+
+
+# load_model_path: None                                                                           # for base coconut training
+# load_model_path: checkpoints/gsm-cot-VLLR/checkpoint_5                                          # for curriculum training
+# load_model_path: checkpoints/gsm-coconut-grpo-tfhead-baseline/checkpoint_12_260316_020323.pt    # for grpo
+load_model_path: checkpoints/gsm-coconut-grpo-tfhead-baseline/checkpoint_21_260317_225931.pt    # for grpo
+
+resume: 0
+reset_optimizer: False
+num_epochs: 1
+
+# Base Coconut hyperparameters
+c_thought: 2
+epochs_per_stage: 2
+max_latent_stage: 3
+# max_latent_stage: 6             # set to 6 for the last step only
+pad_latent_to_max: True
+uniform_prob: 0.2
+gradient_accumulation_steps: 8
+batch_size_training: 4
+
+# batch_size_training: questions per GPU per step.
+# Keep at 1 to limit peak memory from G concurrent rollout graphs.
+weight_decay: 0.01
+seed: 42
+dropout: 0.1
+max_new_tokens: 128
+lr: !!float "5.0e-6"              # previously 1e-5, lowering due to divergent behavior
+
+# Rewards & Loss hyperparameter
+length_penalty_per_token: 0.00
+accuracy_reward_ratio: 0.8        # calculated by acc / (acc + format)
+format_reward_ratio: 0.2          # calculated by format / (acc + format)
+kl_beta: 0.01                     # increased from 0.001 for greater regularization effect
+clip_ratio: 0.2                  # Deepseek-R1 design choice
+
+# Termination head temperature for rollout diversity.
+# Values > 1 explore more varied latent chain lengths across rollouts.
+# Text tokens remain greedy; chain-length diversity alone produces varied answers.
+term_temperature: 1.2
+
+# GRPO hyperparameters
+# lr: !!float "5e-6"      # current best is at 3e-6, 5e-7 improvement speed is SLOW
+# gradient_accumulation_steps: 4
+num_rollouts: 8
+train_batch_size: 8     # previously 32       # may have to increase batch_size from 4, since inter-batch accuracy variability is still very very high
+train_minibatch_size: 16
+eval_batch_size: 64
+ref_model_renewal_steps: 200
+eval_per_steps: 100
+
+sdpa_attention: True
+grad_checkpointing: False

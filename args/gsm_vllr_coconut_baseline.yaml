@@ -1,0 +1,47 @@
+# need 4 gpus
+
+# torchrun --nnodes 1 --nproc_per_node 1 run_baseline.py args/gsm_vllr_coconut_baseline.yaml
+
+project: coconut-baseline
+save_path: checkpoints
+name: gsm-coconut-baseline-latent_stage
+
+only_eval: False
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+mixed_c: False
+no_bot_tokens : False
+
+c_thought: 2
+epochs_per_stage: 3
+max_latent_stage: 3
+pad_latent_to_max: True
+termination_gamma: 1
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+train_path: data/gsm_train.json
+# val_path: data/gsm_valid.json
+val_path: data/gsm_test.json
+load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_3_260326_012439.pt
+# load_model_path: checkpoints/gsm-coconut-VLLR4-5epochs_stage/checkpoint_10     # starts counting at 1
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229.pt
+
+resume: 3     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.     # resume at 13 next time
+reset_optimizer: True
+num_epochs: 12
+batch_size_training: 8
+gradient_accumulation_steps: 4
+lr: !!float "1e-5"
+weight_decay: 0.01
+uniform_prob: 0.0               # reset to 0.0 next round
+seed: 42
+
+sdpa_attention: False
+grad_checkpointing: False

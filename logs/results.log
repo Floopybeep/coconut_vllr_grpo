@@ -1,0 +1,14 @@
+2026/03/12
+    Qwen2.5-1.5B:
+
+
+
+    Baseline:
+        Evaluation Accuracy: 7.41%
+        Evaluation Rewards: 0.151
+        Evaluation Average Latent Steps: 42.46
+
+    COCONUT-GRPO:
+        Evaluation Accuracy: 19.93%
+        Evaluation Rewards: 0.331
+        Evaluation Average Latent Steps: 7.16

@@ -1,0 +1,75 @@
+# GRPO fine-tuning of a pre-trained Coconut model on GSM8K.
+#
+# The model is given only the raw question as the prompt.  It generates its
+# own variable-length latent chain (controlled by the termination head) and
+# then the text answer.  No pre-specified latent schedule is used.
+#
+# Reward = 0.5 × correctness  +  0.5 × latent_efficiency
+# where latent_efficiency = max(0, 1 − 0.01 × max(0, n_latent − 1))
+
+# torchrun --nnodes 1 --nproc_per_node 1 run_grpo_baseline_manual.py args/gsm_vllr_grpo_coconut_baseline.yaml
+
+project: coconut-grpo-baseline
+save_path: checkpoints
+name: gsm-coconut-grpo-baseline
+
+only_eval: True
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+no_bot_tokens: False
+
+termination_gamma: 1.0
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+train_path: data/gsm_train.json
+# train_path: data/gsm_train_original.json        # changed to original because 400k is too many training data, now using only 8k
+val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
+# val_path: data/gsm_valid.json
+
+save_pca_figures: False
+
+
+# Point to a trained SFT / curriculum checkpoint to start GRPO from.
+# Use "None" to start from the raw pre-trained model weights.
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260222_040229.pt       # for coconut start
+# load_model_path: checkpoints/gsm-coconut-grpo-baseline/260305_164727/ref_models/eval_best_model_1_2000_0.24.pt       # for eval only - no length penalty
+load_model_path: checkpoints/gsm-coconut-grpo-baseline/260307_031254/ref_models/eval_best_model_1_1600_0.25.pt       # for eval only - length penalty
+
+resume: 0
+reset_optimizer: False
+num_epochs: 3
+
+# batch_size_training: questions per GPU per step.
+# Keep at 1 to limit peak memory from G concurrent rollout graphs.
+batch_size_training: 4
+weight_decay: 0.01
+seed: 42
+dropout: 0.1
+max_new_tokens: 64
+# lr: !!float "1.0e-5"
+
+# Rewards & Loss hyperparameter
+length_penalty_per_token: 0.01   # previously 0.01, but seems to restrict n_latent to 6 regardless of the problem
+kl_beta: 0.001
+clip_ratio: 10.0
+imitation_beta: 0.05
+entropy_beta: 0.01
+
+# GRPO hyperparameters
+lr: !!float "5e-6"      # current best is at 3e-6, 5e-7 improvement speed is SLOW
+# gradient_accumulation_steps: 4
+num_rollouts: 8
+train_batch_size: 8     # previously 32       # may have to increase batch_size from 4, since inter-batch accuracy variability is still very very high
+train_minibatch_size: 16
+eval_batch_size: 16
+ref_model_renewal_steps: 200
+eval_per_steps: 100
+
+sdpa_attention: True
+grad_checkpointing: False

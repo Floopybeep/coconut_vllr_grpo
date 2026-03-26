@@ -1,4 +1,6 @@
 .venv/**
+.claude/**
 checkpoints/**
+temp/**
 wandb/**
 __pycache__/**

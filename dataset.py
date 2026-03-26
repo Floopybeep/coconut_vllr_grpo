@@ -14,7 +14,17 @@ from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 
-def get_dataset(path, tokenizer, max_size=1000000000):
+def get_dataset(path: str, tokenizer, max_size=1000000000):
+    """
+    Transforms a json dataset into dict
+    Assumes the json dataset is a list of dict, each with "question", "steps" (list of strings), and "answer" keys.
+    Args:
+        path: Path to the json dataset
+        tokenizer: Tokenizer to use for tokenization
+        max_size: Maximum number of samples to load
+    Returns:
+        A HuggingFace Dataset object with tokenized questions, steps, and answers. Keys are "question_tokenized", "steps_tokenized", "answer_tokenized", "answer", and "idx".
+    """
 
     def tokenize_sample(sample):
         """
@@ -35,16 +45,17 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             "question_tokenized": question_tokenized,
             "steps_tokenized": steps_tokenized,
             "answer_tokenized": answer_tokenized,
+            "answer": sample["answer"],
             "idx": sample["idx"],
         }
         return sample
 
     data = json.load(open(path))[:max_size]
-    data = [{**d, "idx": idx} for idx, d in enumerate(data)]
+    data = [{**d, "idx": idx} for idx, d in enumerate(data)]        # adds idx key to each sample in data
+    dataset = Dataset.from_list(data)
 
-    keys = data[0].keys()
-    # keys = sorted(keys)[:32]
-    dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
+    # keys = data[0].keys()
+    # dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
 
     if torch.cuda.device_count() > 1:
         if dist.get_rank() == 0:
@@ -57,7 +68,6 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             processed_dataset = [None]
         dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
-
     else:
         dataset = dataset.map(
             tokenize_sample, remove_columns=list(dataset.features), num_proc=32
@@ -88,7 +98,7 @@ class MyCollator:
 
     def __call__(self, features, return_tensors=None):
 
-        assert self.tokenizer.padding_side == "right"
+        assert self.tokenizer.padding_side in ("right", "left")
 
         """
         Pad the batch like this to maximize the reuse of kv cache.
@@ -132,12 +142,13 @@ class MyCollator:
         return_tensors = "pt"
 
         label_name = "label" if "label" in features[0].keys() else "labels"
+        blacklist = {"position_ids", "answer", "answer_tokenized"}
 
         non_label_position_features = [
             {
                 k: v
                 for k, v in feature.items()
-                if k != label_name and k != "position_ids"
+                if k != label_name and k not in blacklist
             }
             for feature in features
         ]
@@ -163,6 +174,11 @@ class MyCollator:
             if "position_ids" in features[0].keys()
             else None
         )
+        answer = (
+            [feature["answer"] for feature in features]
+            if "answer" in features[0].keys()
+            else None
+        )
         # we have to pad the labels and position_ids manually as we cannot rely on `tokenizer.pad`
 
         if labels is not None:
@@ -185,6 +201,9 @@ class MyCollator:
                 batch["position_ids"], dtype=torch.int64
             )
 
+        if answer is not None:
+            batch["answer"] = answer
+
         return batch
 
 
@@ -197,6 +216,15 @@ def get_question_latent_dataset(
     end_id,
     no_special_marker=False,
 ):
+    """
+    Function for obtaining validation dataset.
+    Returns a dataset with k latent tokens inserted after the question.
+    k = c_thought * latent_stage = c_thought * min(scheduled_stage, max_latent_stage)
+    If pad_latent_to_max, max_latent_stage follows config. Otherwise, it is min(scheduled_stage, max_latent_stage) from config.
+
+    Returns:
+        A HuggingFace Dataset object with "input_ids", "attention_mask", "position_ids", "idx", and "latent_tokens" keys. "latent_tokens" indicates the number of latent tokens.
+    """
 
     def process_dataset(sample):
 
@@ -231,10 +259,65 @@ def get_question_latent_dataset(
     )
 
 
-class CotLatentDataset(torch.utils.data.Dataset):
-    """Lazy dataset wrapper that applies CoT-to-latent transformation on-the-fly.
+def get_grpo_dataset(
+    base_dataset_valid,
+    start_id,
+    no_special_marker=False,
+    shuffle=False,
+    max_question_len=None,
+):
+    """
+    Function for obtaining train/validation dataset for GRPO.
+    Returns a dataset with only the tokenized question.
+    If not no_special_marker, adds a <bot> after the question.
 
-    Change 6: Replaces the expensive .map() materialization that was called every epoch.
+    Args:
+        max_question_len: If set, discard samples whose question_tokenized
+            exceeds this many tokens (before adding special markers).
+
+    Returns:
+        A HuggingFace Dataset object with "input_ids", "attention_mask", "position_ids", "answer_tokenized", "answer", and "idx" keys.
+    """
+
+    if max_question_len is not None:
+        before = len(base_dataset_valid)
+        base_dataset_valid = base_dataset_valid.filter(
+            lambda sample: len(sample["question_tokenized"]) <= max_question_len,
+            num_proc=32,
+        )
+        after = len(base_dataset_valid)
+        if before != after:
+            print(f"[get_grpo_dataset] Filtered {before - after}/{before} samples exceeding {max_question_len} tokens")
+
+    def process_dataset(sample):
+
+        tokens = (
+            sample["question_tokenized"]
+            + ([] if no_special_marker else [start_id])
+        )
+
+        return {
+            "input_ids": tokens,
+            "idx": sample["idx"],
+            "attention_mask": [1] * len(tokens),
+            "position_ids": list(range(len(tokens))),
+            "answer_tokenized": sample["answer_tokenized"],
+            "answer": sample["answer"],
+        }
+
+    output = base_dataset_valid.map(
+        process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
+    )
+    if shuffle:
+        output = output.shuffle(seed=42)
+    return output
+
+
+class CotLatentDataset(torch.utils.data.Dataset):
+    """
+    Lazy dataset wrapper that applies CoT-to-latent transformation on-the-fly.
+
+    Replaces the expensive .map() materialization that was called every epoch.
     The stochastic stage selection (uniform_prob) is applied fresh each __getitem__ call,
     providing better randomization diversity across epochs without the O(N) .map() cost.
     Shuffling is handled by the DataLoader's DistributedSampler, not the dataset itself.
@@ -326,6 +409,9 @@ def get_cot_latent_dataset(
     no_special_marker=False,
     shuffle=False,  # shuffle is now handled by DataLoader/DistributedSampler, kept for API compat
 ):
+    """
+    Function for obtaining training dataset.
+    """
     return CotLatentDataset(
         base_dataset, scheduled_stage, configs,
         start_id, latent_id, end_id,

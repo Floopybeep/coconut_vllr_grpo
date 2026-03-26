@@ -1,0 +1,237 @@
+2026/03/06
+Current Situation
+ - highly optimized to batch_size=12, num_rollouts=8
+ - instituted a length penalty, but seems to converge to shorter lengths regardless of the penalty
+ - rollouts variance instituted by dropout=0.1
+
+Problems
+ - rollout still active during eval? model.eval() is set, but need to investigate further
+ - Is the minibatch implementation by Claude correct? I need to review this code
+
+Takeaways
+
+
+Requiring Improvement
+ - valid loss optimization
+    - How does one optimize a latent trajectory?
+    - Lack of proper research, mathematically sound foundation degrades experiment to mere guesswork
+    - Candidates
+        1. Denoising loss: based on the idea that the latent reasoning chain is iterative refinement of hidden state. Add a noise, try to get it to the previous position?
+        2. Contrastive loss: find diverging trajectories, and push away from them? Requires model/training regimen to recognize whether a trajectory is diverging or converging - can be produced by wrong result maybe?
+
+ - Binary Classification Head
+    - Is a single Linear layer enough to ascertain convergence?
+    - Possibly Transformer layers required?
+    - Is the reward flowing enough?
+
+ - Format rewards
+    - make the format check stricter - all latents before ###, only a single numeric answer after, then endoftext all after
+    - Currently seeing some broken formats still get ###, although it doesn't really result in mode collapse for formatting
+
+Possible Changes
+ - Loss
+    - MSE loss between different loss trajectories, to enforce consistency between different trajectories?
+    - InfoNCE loss to push negatives away from positives? (requires side case handling where there are no positives or negatives in a batch) - less of a problem for extremely larege batch sizes
+
+
+2026/03/10
+Current Situation
+ - Using PCA reduction to analyze a select number of gsm_test samples, I found that for the examples that did not produce a valid answer and ended the latent chain with <|endoftext|>, 
+    the latent trajectory was simple with long distances between points, was short overall, and was noticably different from the trajectories that did produce a valid answer in the correct format.
+    - The trajectories that produced a valid answer often showed a "jittering" phenomenon with multiple small steps 
+
+
+2026/03/17
+Current Situation
+ - Taking the point from PCA analysis, I swapped out the termination head for a 2-layer Transformer
+    - Goal was to learn a more salient signal from the past latent embeddings, which allows a better decision-making on when to terminate thought
+    - Initially meant as a method to prevent early termination that produces no valid answers
+ - Training base curriculum learning was done today
+    - GRPO will run now
+ - Previous ~700 step run with GRPO revealed funky behavior
+    1. Increasing validation loss, increasing accuracy
+    2. Degenerative behavior of using 1 single latent token, followed by cot steps
+        - Reward hacking at its finest, should attempt to not penalize latent steps?
+
+Experiment
+    - Removed latent step length penalty, also penalized internal cot behavior by cutting format reward in half. Accuracy/format reward is 5:5 now, may change to 6:4 if results aren't impressive
+
+
+2026/03/19
+Current Situation
+    - Reward hacking observed from previous experiment, additional changes need to be made
+
+Experiment
+    - Changed formatting to stricter answer checking, where format score is 0 if answer cannot be converted to an int/float
+        - Incurs reward hacking by outputting any random number?
+        - May have to increase accuracy reward ratio
+
+Experiment2
+    - After consulting Claude, I made the following modifications
+        - Format-accuracy ration back to 2:8 (not from Claude)
+        - KL divergence increased 0.001 -> 0.05 to increase regularization
+            - clip ratio still kept to 10 to encourage exploration and allow large mode shifts
+        - max_log_ratio clipped BEFORE torch.exp
+        - ReduceLRonPlateau scheduler added to reduce LR every third eval steps if plateauing
+
+Experiment3
+    - Exp2 yielded severely bad results, so changed how negative reward is applied to iterations that did not produce a valid answer.
+    - Used Claude to implement the following changes:
+        - per-group normalized advantages instead of global normalized advantages
+        - temperature in language sampling to complement dropout-induced different latent chains (MAY have to remove this)
+        - FIX: now using eval mode when calculating loss & log-probs, to prevent different masks from creating different results
+
+Experiment4
+    - Upgraded to Opus for more accurate analysis, and reviewed past design changes
+        - FIX: termination head now only attends to latent tokens, and not language tokens
+        - removed language sampling, as it was causing massive noise in the mathematical calculations
+            - May re-introduce termination sampling (not LM) again if results seem to be diverging
+
+Experiment5
+    - Regularization effect may be too strong, hindering training
+        - reverted KL beta to 0.001
+
+Experiment6
+    - Claude made some okay-soudning suggestions:
+        - KL beta at 0.01, clip ratio at 0.2 (since Deepseek-R1 was for a 60B model, and my model uses a sparser reward signal)
+        - Termination head sampling is implemented for varied output
+
+Next steps
+    - If termination head proves unstable, may have to change experiment a bit by making the transformer essentially "predict" the correctness of the latent chain's results for each step
+        - If prediction accuracy proves to be high, then could freeze the head and use it during the SFT phase of the model training.
+
+
+2026/03/25
+Current Situation
+    - training for paper
+    - need to: train baseline, train baseline + grpo, train head + grpo on SVAMP + gsm-hard and compare
+    - baseline & baseline + grpo on computer, head + grpo on server?
+
+Narrative
+    - GOAL: COCONUT capable of Variable Length latent reasoning, with proof that GRPO can and does improve on latent reasoning efficiency
+    - Yes, COCONUT authors mentioned binary head for latent termination, and went with <eot> prediction
+        - However, I felt that head would be more capable for variable length predictions and greater stability in training - hypothesis
+        - Also, the short mention from the authors lent me to think that the conclusion was drawn from a few select ablation experiments, and that there was more to be gained from deep exploitation
+    - PROOF: 3D PCA reduction chains, 2D PCA reduction 
+
+Experiments
+    1. Baseline: COCONUT, COCONUT + GRPO
+    2. Ours: COCONUT(head) + GRPO
+        - greedy COCONUT + GRPO
+        - sampling on head
+
+
+
+  ---
+  2. Entropy Regularization on the Termination Head
+
+  Your termination head is likely collapsing — either always outputting 1 (stuck in latent mode) or always 0 (never uses latents). The supervised CrossEntropyLoss in forward() uses hard labels (0
+   or 1), so there's no calibration signal.
+
+  term_probs = F.softmax(termination_logits, dim=-1)
+  H = -(term_probs * torch.log(term_probs + 1e-8)).sum(-1)  # (B, L)
+  L_entropy = -H.mean()  # minimize to sharpen, or +H to encourage exploration
+
+  For your case, I'd suggest maximizing entropy at positions before the latent chain is committed (exploration) and minimizing entropy once the pattern is stable (exploitation). A single scalar
+  beta * H.mean() added to the GRPO loss would at least prevent collapse.
+
+  ---
+  3. Reward-Weighted Imitation on Termination Decisions (Dense Signal)
+
+  Your GRPO gradient on the termination head is very sparse — it only flows through the log-prob ratio at positions where a latent was generated. A complementary loss: weight the supervised
+  termination cross-entropy by the rollout reward.
+
+  # In Phase 3 mini-batch loop:
+  term_ce = F.cross_entropy(termination_logits, termination_labels, reduction='none')  # (B, L)
+  L_imitation = (term_ce * reward_weight.unsqueeze(-1)).mean()
+
+  This tells the model: reproduce the termination pattern of high-reward rollouts. It's simpler than contrastive but gives much denser gradients.
+
+  ---
+
+
+Change 1: Before the mini-batch loop
+
+  Replace the block starting with # Training forward in mini-batches... through step_loss = 0.0:
+
+  # Training forward in mini-batches; loss is normalised over ALL tokens globally.
+  total_rollouts  = all_outputs.shape[0]
+  train_mb_size   = configs.train_minibatch_size
+  total_nonmasked = ref_loss_mask.sum().clamp(min=1)
+  max_log_ratio   = torch.tensor(0.0, device=rank)
+  step_loss       = 0.0
+
+  # Hyperparams for new loss terms — add to YAML or fall back to defaults
+  imitation_beta = getattr(configs, 'imitation_beta', 0.05)
+  entropy_beta   = getattr(configs, 'entropy_beta',   0.01)
+
+  # Termination labels: all_term_labels[i, t] = 1 if token at position
+  # (len_question + t) was a latent token. This is the target the termination
+  # head at position (len_question - 1 + t) should have predicted.
+  all_term_labels = (all_token_ids[:, len_question:] == latent_id).long().to(rank)  # (N, gen_len)
+
+  ---
+  Change 2: Mini-batch loop body
+
+  Replace from mb_new_outputs = parallel_model(...) through mb_loss.backward() (lines 825–844):
+
+                      mb_new_outputs = parallel_model(input_embeds=mb_embeds)
+                      mb_new_lp, _   = compute_log_probs(
+                          mb_tok, mb_new_outputs, len_question, latent_id, tokenizer.eos_token_id
+                      )
+
+                      # Extract termination logits before deleting outputs.
+                      # Shape: termination_logits is (mb_size, max_len, 2).
+                      # Slice [len_question-1 : -1] selects the predictions for
+                      # generated positions [len_question .. max_len-1].
+                      mb_term_logits = mb_new_outputs.termination_logits[
+                          :, len_question - 1 : -1, :
+                      ].float()                                                  # (mb_size, gen_len, 2)
+                      del mb_new_outputs
+
+                      # --- Existing GRPO + KL loss ---
+                      mb_log_ratio = mb_new_lp - mb_ref_lp
+                      mb_ratio     = torch.exp(mb_log_ratio).clamp(min=1e-6, max=100.0)
+                      mb_clipped   = torch.clamp(mb_ratio, 1.0 - configs.clip_ratio, 1.0 + configs.clip_ratio)
+
+                      t1 = mb_ratio   * mb_adv.unsqueeze(-1)
+                      t2 = mb_clipped * mb_adv.unsqueeze(-1)
+                      mb_policy_loss = -torch.min(t1, t2)
+
+                      mb_kl = mb_ratio - mb_log_ratio - 1.0
+
+                      # --- Entropy regularisation on termination head ---
+                      # Maximise entropy over {latent, text} at each generated position
+                      # to prevent the termination head collapsing to always-latent or
+                      # always-text. We add -beta*H to the loss (minimising -H = maximising H).
+                      term_probs = F.softmax(mb_term_logits, dim=-1)             # (mb_size, gen_len, 2)
+                      H = -(term_probs * torch.log(term_probs + 1e-8)).sum(-1)   # (mb_size, gen_len)
+                      L_entropy = -(H * mb_ref_mask).sum() / total_nonmasked     # scalar; negative → maximise
+
+                      # --- Reward-weighted termination imitation ---
+                      # Cross-entropy between termination head outputs and the actual
+                      # termination decisions that were taken during rollout, weighted by
+                      # raw reward (clipped to ≥0 so we only imitate successful trajectories).
+                      mb_term_labels = all_term_labels[mb_start:mb_end]          # (mb_size, gen_len)
+                      mb_raw_rewards = all_rewards[mb_start:mb_end].clamp(min=0) # (mb_size,)
+
+                      mb_term_ce = F.cross_entropy(
+                          mb_term_logits.reshape(-1, 2),
+                          mb_term_labels.reshape(-1),
+                          reduction='none',
+                      ).reshape(mb_term_labels.shape)                            # (mb_size, gen_len)
+
+                      L_imitation = (
+                          mb_term_ce * mb_ref_mask * mb_raw_rewards.unsqueeze(-1)
+                      ).sum() / total_nonmasked                                   # scalar
+
+                      # --- Combined loss ---
+                      mb_total_loss = (
+                          mb_policy_loss
+                          + configs.kl_beta  * mb_kl
+                          + imitation_beta   * L_imitation
+                          + entropy_beta     * L_entropy
+                      )
+                      mb_loss = (mb_total_loss * mb_ref_mask).sum() / total_nonmasked
+
+                      mb_loss.backward()
