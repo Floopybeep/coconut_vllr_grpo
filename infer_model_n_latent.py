@@ -15,36 +15,10 @@ import argparse
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import numpy as np
+
 from coconut_baseline import Coconut
-from dataset import get_dataset
-from utils import Config, set_seed
-
-
-def generate_forced_latent(model, input_ids, attention_mask, n_latent, latent_id, start_id, end_id, max_new_tokens=128):
-    """
-    Generate with a forced number of latent tokens.
-
-    Builds input: question_tokens + [start_latent] + [latent]*n_latent + [end_latent]
-    Then runs the model's generate_base (greedy text generation after latent processing).
-    """
-    device = input_ids.device
-
-    # Build input: question + start + n_latent latents + end
-    latent_block = torch.tensor(
-        [start_id] + [latent_id] * n_latent + [end_id],
-        dtype=torch.long, device=device,
-    ).unsqueeze(0)
-
-    full_input_ids = torch.cat([input_ids, latent_block], dim=1)
-    full_attention_mask = torch.ones_like(full_input_ids, device=device)
-
-    outputs = model.generate_base(
-        full_input_ids,
-        full_attention_mask,
-        max_new_tokens=max_new_tokens,
-        synced_gpus=False,
-    )
-    return outputs
+from utils import Config, set_seed, visualize_latent_pca
 
 
 def extract_answer(text):
@@ -128,12 +102,13 @@ def main():
         model.to(torch.bfloat16)
     model.eval()
 
-    # Prepare log file
+    # Prepare log directory and file
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join("logs", "n_latent")
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"coconut-baseline_{current_time}.log")
+    run_dir = os.path.join("logs", "n_latent", current_time)
+    os.makedirs(run_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, f"coconut-baseline_{current_time}.log")
     print(f"Logging to: {log_path}")
+    print(f"PCA plots to: {run_dir}/<query_num>/")
 
     # Build queries
     if args.query is not None:
@@ -183,18 +158,21 @@ def main():
                 log_fp.write(f"Ground truth: {answer_gt}\n")
                 log_fp.write(f"{'-' * 60}\n")
 
+                input_len = input_ids.shape[1]
+                pca_dir = os.path.join(run_dir, str(query["idx"] + 1))
+
                 for n_latent in range(1, n_latent_max + 1):
-                    outputs = generate_forced_latent(
-                        model, input_ids, attention_mask,
-                        n_latent=n_latent,
-                        latent_id=latent_id,
-                        start_id=start_id,
-                        end_id=end_id,
+                    token_output, all_embeds = model.generate_n(
+                        input_ids,
+                        attention_mask,
+                        num_latents=n_latent,
                         max_new_tokens=args.max_new_tokens,
+                        output_embedding=True,
+                        synced_gpus=False,
                     )
 
-                    full_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
-                    text_no_special = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    full_text = tokenizer.decode(token_output[0], skip_special_tokens=False)
+                    text_no_special = tokenizer.decode(token_output[0], skip_special_tokens=True)
                     answer_extracted = extract_answer(text_no_special)
                     is_correct = answer_extracted == answer_gt
 
@@ -204,10 +182,24 @@ def main():
 
                     log_fp.write(f"  n_latent={n_latent:3d} | correct={is_correct} | extracted='{answer_extracted}' | full='{full_text}'\n")
 
+                    # Extract latent embeddings and generate PCA plot
+                    # Latent embeddings sit at positions input_len .. input_len + n_latent - 1
+                    latent_embeds = all_embeds[0, input_len:input_len + n_latent, :].detach().cpu().float().numpy()
+                    if latent_embeds.shape[0] >= 3:
+                        visualize_latent_pca(
+                            latent_embeds,
+                            title=f"Q{query['idx']+1} n_latent={n_latent}",
+                            output_dir=pca_dir,
+                            question=question,
+                            answer=answer_gt,
+                            predicted=answer_extracted,
+                            idx=n_latent,
+                        )
+
                     # Clear KV cache
                     if hasattr(model, 'kv_cache'):
                         model.kv_cache = None
-                    del outputs
+                    del token_output, all_embeds
 
                 log_fp.write(f"{'=' * 80}\n\n")
                 log_fp.flush()

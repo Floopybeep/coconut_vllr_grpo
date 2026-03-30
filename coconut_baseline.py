@@ -59,8 +59,10 @@ class Coconut(nn.Module):
                 model_embedding.embedding_dim,
                 padding_idx=model_embedding.padding_idx
             )
+            self.embedding.weight.data.copy_(model_embedding.weight.data)
             self.embedding.norm = nn.Identity()
             self.base_causallm.set_input_embeddings(self.embedding)
+            self.base_causallm.lm_head.weight = self.embedding.weight
 
     def _forward_base(self, inputs_embeds, attention_mask=None, position_ids=None, past_key_values=None):
         """Call base transformer directly and apply lm_head manually.
@@ -342,23 +344,27 @@ class Coconut(nn.Module):
             return torch.tensor(tokens).view(1, -1)
 
 
-    def generate_cot(
+    def generate_n(
         self,
         input_ids,
         attention_mask,  # attention_mask is not used
-        num_outputs_per_batch=4,
+        num_latents=0,
         max_new_tokens=100,
         output_embedding=False,
         synced_gpus=False,
         **kwargs
     ):
-        # NEEDS WORK, NOT YET IMPLEMENTED!!
+        """Generate with a forced number of latent steps.
 
+        Like generate(), but instead of consulting the termination head,
+        the first `num_latents` tokens are forced to be latent (continuous
+        thought feedback), then the rest are greedy text tokens.
+        """
         self.gen_forward_cnt = 0
 
         tokens = input_ids[0].detach().tolist()
 
-        labels = input_ids.clone()  # placeholder. not used.
+        labels = input_ids.clone()  # placeholder, not used
         outputs = self.forward(
             input_ids,
             torch.ones_like(input_ids, device=input_ids.device),
@@ -368,104 +374,48 @@ class Coconut(nn.Module):
             ).reshape(1, -1),
         )
         inputs_embeds = outputs.inputs_embeds
+        latents_emitted = 0
 
-        # get the first token using the current hidden state
-        next_token = torch.argmax(outputs.logits[0, -1]).item()
-        tokens.append(next_token)
-        new_token_embed = self.embedding(
-            torch.tensor(next_token, device=input_ids.device)
-        ).view(1, 1, -1)
-        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
-
-        # get other tokens
-        for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
-            self.gen_forward_cnt += 1
-
-            next_token = torch.argmax(outputs.logits[0, -1]).item()
-            if next_token == self.eos_token_id:
-                break
-            new_token_embed = self.embedding(
-                torch.tensor(next_token, device=input_ids.device)
-            ).view(1, 1, -1)
-            tokens.append(next_token)
-            new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
-
-        if synced_gpus:
-            # in FSDP, the number of forward pass need to be the same across devices
-            while (
-                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
-            ):  # leave some room for latent tokens
-                self.gen_forward_cnt += 1
-                _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
-
-        if output_embedding:
-            # for analysis purpose
-            return torch.tensor(tokens).view(1, -1), new_inputs_embeds
-
+        # First token decision: forced latent or text
+        if latents_emitted < num_latents:
+            next_token = self.latent_token_id
+            new_token_embed = outputs.output_embeds[0, -1].view(1, 1, -1)
+            latents_emitted += 1
         else:
-            return torch.tensor(tokens).view(1, -1)
-
-
-    def generate_base(
-        self,
-        input_ids,
-        attention_mask,  # attention_mask is not used
-        max_new_tokens=16,
-        output_embedding=False,
-        synced_gpus=False,
-        **kwargs
-    ):
-
-        self.gen_forward_cnt = 0
-
-        assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
-
-        tokens = input_ids[0].detach().tolist()
-
-        labels = input_ids.clone()  # placeholder. not used.
-        outputs = self.forward(
-            input_ids,
-            torch.ones_like(input_ids, device=input_ids.device),
-            labels,
-            torch.arange(
-                0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
-            ).reshape(1, -1),
-        )
-        inputs_embeds = outputs.inputs_embeds
-
-        # get the first token using the current hidden state
-        next_token = torch.argmax(outputs.logits[0, -1]).item()
-        tokens.append(next_token)
-        new_token_embed = self.embedding(
-            torch.tensor(next_token, device=input_ids.device)
-        ).view(1, 1, -1)
-        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
-
-        # get other tokens
-        for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
-            self.gen_forward_cnt += 1
             next_token = torch.argmax(outputs.logits[0, -1]).item()
-            if next_token == self.eos_token_id:
-                break
-            tokens.append(next_token)
             new_token_embed = self.embedding(
                 torch.tensor(next_token, device=input_ids.device)
             ).view(1, 1, -1)
+
+        tokens.append(next_token)
+        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
+
+        # Remaining tokens
+        for _ in range(max_new_tokens - 1):
+            outputs = self.forward(input_embeds=new_inputs_embeds)
+            self.gen_forward_cnt += 1
+
+            if latents_emitted < num_latents:
+                next_token = self.latent_token_id
+                new_token_embed = outputs.output_embeds[0, -1].view(1, 1, -1)
+                latents_emitted += 1
+            else:
+                next_token = torch.argmax(outputs.logits[0, -1]).item()
+                if next_token == self.eos_token_id:
+                    break
+                new_token_embed = self.embedding(
+                    torch.tensor(next_token, device=input_ids.device)
+                ).view(1, 1, -1)
+
+            tokens.append(next_token)
             new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
 
         if synced_gpus:
-            # in FSDP, the number of forward pass need to be the same across devices
-            while (
-                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
-            ):  # leave some room for latent tokens
+            while self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT:
                 self.gen_forward_cnt += 1
                 _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
 
         if output_embedding:
-            # for analysis purpose
             return torch.tensor(tokens).view(1, -1), new_inputs_embeds
-
         else:
             return torch.tensor(tokens).view(1, -1)

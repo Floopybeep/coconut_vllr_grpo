@@ -29,15 +29,16 @@ model_id: Qwen/Qwen2.5-1.5B
 train_path: data/gsm_train.json
 # val_path: data/gsm_valid.json
 val_path: data/gsm_test.json
-load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_3_260326_012439.pt
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_4_260326_135904.pt      # trained Qwen-CoT
+load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_12_260326_181252.pt      # trained Qwen-CoT
 # load_model_path: checkpoints/gsm-coconut-VLLR4-5epochs_stage/checkpoint_10     # starts counting at 1
 # load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229.pt
 
-resume: 3     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.     # resume at 13 next time
+resume: 18     # starting epoch, starts counting at 0. If need to start at epoch 6, enter 6.     # resume at 13 next time
 reset_optimizer: True
-num_epochs: 12
-batch_size_training: 8
-gradient_accumulation_steps: 4
+num_epochs: 21
+batch_size_training: 4
+gradient_accumulation_steps: 8
 lr: !!float "1e-5"
 weight_decay: 0.01
 uniform_prob: 0.0               # reset to 0.0 next round

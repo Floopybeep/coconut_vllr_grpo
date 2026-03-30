@@ -189,11 +189,6 @@ class Coconut(nn.Module):
                 model_embedding.embedding_dim,
                 padding_idx=model_embedding.padding_idx
             )
-            # Copy pretrained weights into StableEmbedding BEFORE tying lm_head.
-            # set_input_embeddings() does not auto-retie lm_head for Qwen2/Llama,
-            # so we must tie explicitly — but only after the embedding holds the
-            # correct pretrained weights, otherwise lm_head would be overwritten
-            # with random values.
             self.embedding.weight.data.copy_(model_embedding.weight.data)
             self.embedding.norm = nn.Identity()
             self.base_causallm.set_input_embeddings(self.embedding)

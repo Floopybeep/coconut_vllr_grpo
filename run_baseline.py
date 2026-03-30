@@ -229,6 +229,10 @@ def main():
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
+    if configs.load_model_path != "None":
+        del saved_weights, saved_checkpoint
+        gc.collect()
+
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
 

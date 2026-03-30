@@ -121,6 +121,34 @@ Experiments
         - sampling on head
 
 
+2026/03/27
+Future Ideas
+    1. Curriculum Training Improvements
+        1-1. Instead of procedural latent replacements, use a statistics-based method of replacing random step to random # of latents in [start, end]
+            - This will hopefully have the effect of teaching the model to interchange latent/language steps at will
+        1-2. Instead of dropout-induced GRPO, use length-varied GRPO to further induce the "optimization" of latent reasoning chains
+            - This will hopefully reinforce the optimal length of latent steps to the model
+                - However, it may reduce exploration towards reduced number of latent steps, as it may only reinforce the status quo + longer latents due to 
+            - Possible alternative: force [num_steps*start, num_steps*end] steps in GRPO first, then find the best-performing num_latents, and follow up with num_latents +/- n_beta GRPO.
+            - 
+
+
+2026/03/28
+Current Situation
+    1. Qwen + SFT baseline: 67.2% on validation set (not tested on test)
+    2. Coconut baseline: 23.7% on validation set (for step=3), still need to train on k=6 (expect lower results)
+
+Next step
+    1. GRPO like always on 2
+    2. GRPO with revised termination head loss/mask/calculations on 2
+    3. Write paper
+
+
+2026/03/29
+Current Situation
+    1. Qwen + SFT baseline: 67.2%
+    2. Coconut baseline: 20.0%
+
 
   ---
   2. Entropy Regularization on the Termination Head

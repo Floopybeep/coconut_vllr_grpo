@@ -839,11 +839,9 @@ def main():
                     del mb_new_outputs
 
                     mb_log_ratio = mb_new_lp - mb_ref_lp
-                    # Clamp log_ratio before exp() — at ±5 the effective ratio is ~148,
-                    # far outside the PPO clip window, so clamping does not distort the
-                    # gradient under normal training; it only prevents exp() overflow.
-                    mb_log_ratio_clamped = mb_log_ratio.clamp(-5.0, 5.0)
+                    mb_log_ratio_clamped = mb_log_ratio.clamp(-5, 5)        # prevent overflow
                     mb_ratio     = torch.exp(mb_log_ratio_clamped)
+                    # mb_clipped   = mb_ratio
                     mb_clipped   = torch.clamp(mb_ratio, 1.0 - configs.clip_ratio, 1.0 + configs.clip_ratio)
 
                     t1 = mb_ratio   * mb_adv.unsqueeze(-1)
@@ -1167,9 +1165,10 @@ def main():
                 output_dir=os.path.join(save_dir, "plots"),
             )
 
-            print(f"Correct Var: {sum(pca_variances_correct)/len(pca_variances_correct):.3f}")
-            print(f"Incorrect Var: {sum(pca_variances_incorrect)/len(pca_variances_incorrect):.3f}")
-            print(f"Noformat Var: {sum(pca_variances_noformat)/len(pca_variances_noformat):.3f}")
+            if configs.save_pca_figures:
+                print(f"Correct Var: {sum(pca_variances_correct)/len(pca_variances_correct):.3f}")
+                print(f"Incorrect Var: {sum(pca_variances_incorrect)/len(pca_variances_incorrect):.3f}")
+                print(f"Noformat Var: {sum(pca_variances_noformat)/len(pca_variances_noformat):.3f}")
 
         if wandb_run and rank == 0:
             wandb_run.log({

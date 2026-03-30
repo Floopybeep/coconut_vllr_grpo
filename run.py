@@ -83,6 +83,16 @@ def print_memory_breakdown(model, optimizer):
 # print_memory_breakdown(model, optimizer)
 
 
+def save_model(parallel_model, save_path):
+    with FSDP.summon_full_params(parallel_model, writeback=False, rank0_only=False):
+        state_dict = {k: v.detach().cpu().clone()
+        for k, v in parallel_model.module.state_dict().items()}
+
+    torch.save({"model_state_dict": state_dict}, save_path)
+    print(f"Saved model checkpoint at {save_path}!")
+
+
+
 def main():
 
     # Init ####################################################################################################################
@@ -504,25 +514,12 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                checkpoint = {
-                    "epoch": epoch,
-                    "model_state_dict": parallel_model.state_dict(),
-                    "optimimzer_state_dict": optimizer.state_dict()
-                }
                 if rank == 0:
-                    torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt"))
+                    path_model_save = os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt")
+                    save_model(parallel_model, path_model_save)
                     print("saving model.")
 
-                # states = parallel_model.state_dict()
-                # if rank == 0:
-                #     torch.save(
-                #         states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
-                #     )
-                #     print("saving model.")
-                # del states
-
                 dist.barrier()
-                del checkpoint
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -648,21 +645,15 @@ def main():
             and not configs.debug
             and not configs.only_eval
         ):
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": parallel_model.state_dict(),
-                "optimimzer_state_dict": optimizer.state_dict()
-            }
-            # states = parallel_model.state_dict()
 
             if rank == 0:
-                torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt"))
+                path_model_save = os.path.join(save_dir, f"checkpoint_{epoch + 1}_{current_time}.pt")
+                save_model(parallel_model, path_model_save)
                 print("saving model.")
 
             best_acc = cor / total
 
             dist.barrier()
-            del states
             gc.collect()
             torch.cuda.empty_cache()
 

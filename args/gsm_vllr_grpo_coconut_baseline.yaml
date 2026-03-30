@@ -13,7 +13,8 @@ project: coconut-grpo-baseline
 save_path: checkpoints
 name: gsm-coconut-grpo-baseline
 
-only_eval: True
+only_eval: False
+# only_eval: True
 
 coconut: True
 cot: False
@@ -28,9 +29,10 @@ bf16: True
 save_only_improve: False
 model_id: Qwen/Qwen2.5-1.5B
 train_path: data/gsm_train.json
+# train_path: data/svamp_gsm_hard_train.json
 # train_path: data/gsm_train_original.json        # changed to original because 400k is too many training data, now using only 8k
-val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
-# val_path: data/gsm_valid.json
+# val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
+val_path: data/gsm_valid.json
 
 save_pca_figures: False
 
@@ -38,12 +40,11 @@ save_pca_figures: False
 # Point to a trained SFT / curriculum checkpoint to start GRPO from.
 # Use "None" to start from the raw pre-trained model weights.
 # load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260222_040229.pt       # for coconut start
-# load_model_path: checkpoints/gsm-coconut-grpo-baseline/260305_164727/ref_models/eval_best_model_1_2000_0.24.pt       # for eval only - no length penalty
-load_model_path: checkpoints/gsm-coconut-grpo-baseline/260307_031254/ref_models/eval_best_model_1_1600_0.25.pt       # for eval only - length penalty
+load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260328_152119.pt       # new model, eval at 20% initially
 
 resume: 0
 reset_optimizer: False
-num_epochs: 3
+num_epochs: 1
 
 # batch_size_training: questions per GPU per step.
 # Keep at 1 to limit peak memory from G concurrent rollout graphs.
@@ -56,10 +57,8 @@ max_new_tokens: 64
 
 # Rewards & Loss hyperparameter
 length_penalty_per_token: 0.01   # previously 0.01, but seems to restrict n_latent to 6 regardless of the problem
-kl_beta: 0.001
-clip_ratio: 10.0
-imitation_beta: 0.05
-entropy_beta: 0.01
+kl_beta: 0.01
+clip_ratio: 0.2
 
 # GRPO hyperparameters
 lr: !!float "5e-6"      # current best is at 3e-6, 5e-7 improvement speed is SLOW

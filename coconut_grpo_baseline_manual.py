@@ -60,8 +60,10 @@ class Coconut(nn.Module):
                 model_embedding.embedding_dim,
                 padding_idx=model_embedding.padding_idx
             )
+            self.embedding.weight.data.copy_(model_embedding.weight.data)
             self.embedding.norm = nn.Identity()
             self.base_causallm.set_input_embeddings(self.embedding)
+            self.base_causallm.lm_head.weight = self.embedding.weight
             # self.base_causallm.tie_weights()                                                                      # When training, NEED to turn this on!
 
     def _forward_base(self, inputs_embeds, attention_mask=None, position_ids=None, past_key_values=None):
