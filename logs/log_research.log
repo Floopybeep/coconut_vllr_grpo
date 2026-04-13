@@ -147,7 +147,128 @@ Next step
 2026/03/29
 Current Situation
     1. Qwen + SFT baseline: 67.2%
-    2. Coconut baseline: 20.0%
+    2. Coconut baseline: 20.2% (6 latent tokens) / 19.2% (termination head) [Validation set: 18.55% (6 latent tokens) / 15.62% (termination head)]
+
+Problem
+    1. Discovered that Coconut baseline was not trained with tied embeddings - possible source of problem
+        - Evaluation was performed without termination head, on gsm_coconut.yaml and run.py. The recovered accuracy is still very similar, so it is likely valid.
+        - Still, I will rent another 5090 to try to train another model with tied weights this time, to both reduce model weights and to confirm the impact of this error
+    2. GRPO with GSM8k-aug produces really shitty results (~10%)
+        - Will try to run with clip ratio reduced to 0.2, and KL divergence penalty to 0.01 instead of 0.001
+            - includes turning off tied embeddings
+
+TODO
+    1. GRPO with a comparable math dataset to GSM8k (to prevent memorization of training set) (3/30)
+    2. Training termination head Coconut baseline with tied embeddings
+    3. Ablation test of greedy decoding vs sampling with low temperature from the termination head logit
+    4. Try GRPO without KL divergence (https://cameronrwolfe.substack.com/p/grpo-tricks)
+
+
+TODO - future
+    1. GRPO without dropout, but with explicitly different latent lengths to train termination head
+    2. Latent-Zero, by SFT on pretrained model for formatting, then directly feeding latent states via GRPO
+    3. Coconut-stochastic, by replacing random steps instead of from the start. Experiment with random # of latents per step, and with random # steps replaced total at random positions
+
+
+2026/03/30
+Current Situation
+    1. GRPO + forced off-policy exploration + term head sampling + smaller clamping(higher upper clamp) = 23.81% eval, 21.53% on forced n=6
+        checkpoint: checkpoints/gsm-coconut-grpo-baseline/260331_182910_termsampling_forced2x_smallerclip/checkpoint_1_260331_182910.pt
+        baseline: 19.26% on grpo, 26.9% at forced n=6
+    2. #1 on data/openmath2_augmented_math.json (2000*8 samples, filtered by 128 max tokens) = 26.46% eval, 26.38% on forced n=6 (deleted by accident)
+    3. #1 on data/openmath2_augmented_gsm8k.json (same #samples, dataset) = 24.18% eval, 
+
+    4. Changed to EMAhead instead, which concatenates the latent vector + moving average of latent vectors thus far + (current latent - last latent diff) to use as input to the termination head
+        Currently training with 
+
+
+Paper Writing
+    1. Should compare to evaluation of accuracy on # of latent steps, based on termination head and # latents by coconut
+
+
+2026/04/07
+Current Situation
+    1. Analyzed # of latents possible for each question, the # of latents reached by the termination head, and the % of questions gotten right/wrong that could have been wrong/right
+        - For 3~16 latent steps...
+            - 7 were 100% correct in all steps
+            - 359 were partially correct for some steps
+                - 33 had 25% or fewer correct steps (9.2%)
+                - 77 had 50% or fewer correct steps (21.4%)
+                - 235 had 75% or fewer correct steps
+                - 14 had 81% correct steps (maximum, because start/2nd steps are not counted)
+            - 52 were 100% incorrect
+            - 855 were partially incorrect
+                - 737 were 0% correct       (86.2%)
+                - 66 had 1 correct node
+                - 16 had 2 correct nodes
+                - 98(66 + 16 + 16) had 25% or fewer correct steps (11.5%)
+                - 16 had 50% or fewer correct steps
+                - 4 had 56% correct steps               (2.3% with 50%)
+            - 46 were partially wrongly formatted
+
+        -   260406_053348
+            n_latent   correct     total    accuracy
+            ----------------------------------------
+                3       355      1319      0.2691
+                4       333      1319      0.2525
+                5       314      1319      0.2381
+                6       299      1319      0.2267
+                7       356      1319      0.2699
+                8       340      1319      0.2578
+                9       295      1319      0.2237
+                10       332      1319      0.2517
+                11       237      1319      0.1797
+                12       303      1319      0.2297
+                13        85      1319      0.0644
+                14        95      1319      0.0720
+                15       206      1319      0.1562
+                16       163      1319      0.1236
+
+        - 260404_152450_trainedhead_grpo2
+          n_latent   correct     total    accuracy
+            ----------------------------------------
+                3       353      1319      0.2676
+                4       335      1319      0.2540
+                5       307      1319      0.2328
+                6       294      1319      0.2229
+                7       358      1319      0.2714
+                8       340      1319      0.2578
+                9       323      1319      0.2449
+                10       342      1319      0.2593
+                11       241      1319      0.1827
+                12       305      1319      0.2312
+                13        81      1319      0.0614
+                14        62      1319      0.0470
+                15       153      1319      0.1160
+                16       228      1319      0.1729
+
+        - 260404_002142 (MATH 80%)
+          n_latent   correct     total    accuracy
+            ----------------------------------------
+                3       360      1319      0.2729
+                4       338      1319      0.2563
+                5       313      1319      0.2373
+                6       307      1319      0.2328
+                7       352      1319      0.2669
+                8       329      1319      0.2494
+                9       305      1319      0.2312
+                10       342      1319      0.2593
+                11       292      1319      0.2214
+                12       286      1319      0.2168
+                13        46      1319      0.0349
+                14        84      1319      0.0637
+                15       168      1319      0.1274
+                16       239      1319      0.1812
+
+        - Conclusion: Instead of 359/1319(27.2%), the maximum possible score was 477/1319(36.2%), which shows that there are still some gains to be made from a well-trained termination head
+                        However, the statistics show that the biggest limitation is imposed by the LLM's capability, which is 36.2% at maximum.
+        - Additional Analysis: Max possible score is 478/1319 for baseline, 488/1319 for 260406_053348, 491/1319 for 260404_152450_trainedhead_grpo2, 490/1319 for 260404_002142
+    2. Current problem: accuracy increases for ~300 steps before continuously degrading
+        - Analysis: termination head & LLM reward being grouped together incentivizes term head to fit to LLM, never pushing it out of its c=3 comfort zone. I.e. Termination head is disincentivized to explore longer lengths.
+        - Solution: Latent length reward for termination head(0.05 per latent step)
+        - Run: checkpoints/gsm-coconut-grpo-emahead/260407_025310
+        - Result: Average latent length successfully increases during training (train: 7->10, eval: 7->8), however accuracy decreases (26.5% -> 25.3%) pretty linearly
+        - Next: Try for a longer training run? 
 
 
   ---

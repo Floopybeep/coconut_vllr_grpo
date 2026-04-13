@@ -21,7 +21,7 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from coconut_grpo_baseline_manual import Coconut
+from coconut_grpo_emahead import Coconut
 from dataset import (
     get_dataset,
     get_grpo_dataset,
@@ -95,49 +95,74 @@ def extract_answer(text, eot_token):
 
 
 def compute_reward(generated_ids, tokenizer, ground_truth,
-                            latent_id, length_penalty=0.01, format_score_ratio=0.2, coconut_mode=True, is_print=False):
+                            latent_id, length_penalty=0.01, format_penalty=-0.5,
+                            latent_step_reward=0.0, coconut_mode=True, is_print=False):
     """
-    Combined reward balancing correctness and latent-chain efficiency.
-    80% correctness, 20% format score
+    Combined reward balancing correctness, format compliance, and latent usage.
+
+    Reward scale:
+        +1.0 + latent_step_reward * n_latent   correct answer, clean format
+        +0.0 + latent_step_reward * n_latent   wrong answer, clean format
+        format_penalty (default -0.5)           format violation
 
     Args:
         generated_ids: (B, L) tensor — full sequence including question tokens
         tokenizer:     tokenizer for decoding
         ground_truth:  expected answer string
         latent_id:     token id used for latent positions
+        format_penalty: negative reward for format violations
+        latent_step_reward: small positive reward per latent token (encourages exploration)
         coconut_mode:  whether to keep special tokens when decoding
 
     Returns:
         total_reward (list[float]), n_latent (list[int])
     """
-    total_reward, accuracies, extracted_answers = [], [], []
+    total_reward, base_reward, accuracies, extracted_answers = [], [], [], []
     n_latents, n_latents_correct = [], []
     for i in range(generated_ids.shape[0]):     # iterate across batch
         text = tokenizer.decode(generated_ids[i, :], skip_special_tokens=not coconut_mode)      # list of strings
         answer = extract_answer(text, "<|endoftext|>")
         extracted_answers.append(answer)
 
-        # Check for output format penalty
-        format_score = 1.0
-        if answer.find("<|start-latent|>") != -1 or answer.find("<|end-latent|>") != -1:
-            format_score = 0.0
+        num_latent = (generated_ids[i, :] == latent_id).sum().item()
+        n_latents.append(num_latent)
+
+        # Check for format violations (negative reward)
+        format_violation = False
+
+        # 1. Latent markers leaked into text answer
+        if "<|start-latent|>" in answer or "<|end-latent|>" in answer:
+            format_violation = True
             answer = answer.replace("<|start-latent|>", "").replace("<|end-latent|>", "")
 
-        # Compute answer score
-        correctness = 1.0 if answer == ground_truth[i] else 0.0               # for list of answers, given as [ans1, ans2, ...]
-        # correctness = 1.0 if answer == ground_truth else 0.0                    # batch["answer"] is a list of strings, so use [i] if not indexed before function
-        accuracies.append(correctness)
-        num_latent = (generated_ids[i, :] == latent_id).sum().item()
-        correctness = max(0, correctness - length_penalty * max(0, num_latent - 1))
-        if num_latent == 0:
-            correctness = 0.0
+        # 2. Empty or invalid answer (no parseable content after ###)
+        cleaned = answer.strip()
+        if not cleaned or cleaned == "#":
+            format_violation = True
 
-        n_latents.append(num_latent)
+        # 3. No latent tokens at all (model skipped reasoning entirely)
+        if num_latent == 0:
+            format_violation = True
+
+        # 4. CoT steps found during reasoning
+        if "<<" in answer or ">>" in answer:
+            format_violation = True
+
+        # Compute correctness (tracked separately for accuracy metric)
+        correctness = 1.0 if answer == ground_truth[i] else 0.0
+        accuracies.append(correctness)
+
+        # Compute reward
+        if format_violation:
+            reward_base = format_penalty
+        else:
+            reward_base = correctness - length_penalty * max(0, num_latent - 1)
+        reward = reward_base + (latent_step_reward * num_latent if not format_violation else 0.0)
+
         if answer == ground_truth[i]:
             n_latents_correct.append(num_latent)
 
-        # Count latent_id tokens in generated_ids
-        reward = max(0, (1 - format_score_ratio) * correctness + format_score_ratio * format_score)
+        base_reward.append(reward_base)
         total_reward.append(reward)
 
         if is_print:
@@ -145,10 +170,10 @@ def compute_reward(generated_ids, tokenizer, ground_truth,
             print(f"Predicted answer: '{answer}'")
             print(f"Ground truth: {ground_truth[i]}")
             print(reward, num_latent)
-    
+
     accuracy = sum(accuracies) / len(accuracies)
 
-    return total_reward, accuracy, extracted_answers, accuracies, n_latents, n_latents_correct
+    return total_reward, base_reward, accuracy, extracted_answers, accuracies, n_latents, n_latents_correct
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +369,7 @@ def main():
 
     if rank == 0:
         import shutil
-        for _src in [__file__, os.path.join(os.path.dirname(__file__), "coconut_grpo_baseline_manual.py"), os.path.join(os.path.dirname(__file__), "args", "gsm_vllr_grpo_coconut_baseline.yaml")]:
+        for _src in [__file__, os.path.join(os.path.dirname(__file__), "coconut_grpo_emahead.py"), os.path.join(os.path.dirname(__file__), "args", "gsm_vllr_grpo_emahead.yaml")]:
             shutil.copy2(_src, os.path.join(save_dir, os.path.basename(_src)))
 
     cur_ckpts = os.listdir(save_dir)
@@ -469,11 +494,13 @@ def main():
 
     if configs.coconut:
         ref_base_model = copy.deepcopy(model)
-        ref_model = Coconut(ref_base_model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
+        ref_model = Coconut(ref_base_model, latent_id, start_id, end_id, tokenizer.eos_token_id,
+                            configs.termination_gamma, ema_decay=configs.ema_decay, bottleneck_ratio=configs.bottleneck_ratio)
         if configs.bf16:
             ref_model = ref_model.to(dtype=torch.bfloat16)
         ref_model = ref_model.to(device="cpu")
-        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
+        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id,
+                        configs.termination_gamma, ema_decay=configs.ema_decay, bottleneck_ratio=configs.bottleneck_ratio)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -520,9 +547,31 @@ def main():
     )
 
     if not configs.only_eval:
-        base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=3200 if configs.debug else int(configs.num_steps * configs.train_batch_size * 1.5)
-        )
+        total_train_samples = 3200 if configs.debug else int(configs.num_steps * configs.train_batch_size * 1.5)
+
+        # Mixed dataset loading: primary (e.g. MATH) + secondary (e.g. GSM8K)
+        train_path_secondary = getattr(configs, 'train_path_secondary', 'None')
+        dataset_mix_ratio = getattr(configs, 'dataset_mix_ratio', 1.0)  # fraction from primary
+
+        if train_path_secondary != 'None' and dataset_mix_ratio < 1.0:
+            n_primary = int(total_train_samples * dataset_mix_ratio)
+            n_secondary = total_train_samples - n_primary
+
+            base_dataset_primary = get_dataset(configs.train_path, tokenizer, max_size=n_primary)
+            base_dataset_secondary = get_dataset(train_path_secondary, tokenizer, max_size=n_secondary)
+
+            from datasets import concatenate_datasets
+            base_dataset_train = concatenate_datasets([base_dataset_primary, base_dataset_secondary])
+
+            if rank == 0:
+                print(f"Mixed dataset: {len(base_dataset_primary)} from {configs.train_path} "
+                      f"+ {len(base_dataset_secondary)} from {train_path_secondary} "
+                      f"= {len(base_dataset_train)} total")
+            del base_dataset_primary, base_dataset_secondary
+        else:
+            base_dataset_train = get_dataset(
+                configs.train_path, tokenizer, max_size=total_train_samples
+            )
 
     # if "gsm" in configs.val_path:
     #     # max_new_tokens = 64                   # change
@@ -663,7 +712,21 @@ def main():
             # forced-rollout minimum (= 2x this value).  Seeded from configs.forced_latent_init.
             avg_n_latent_last_batch = float(configs.forced_latent_init)
 
-            for step, batch in enumerate(train_dataloader):     
+            # Warmup freeze: train only the termination head during warmup_steps,
+            # so it learns a meaningful continue/stop policy before LLM weights shift.
+            llm_frozen = False
+            warmup_freeze_steps = getattr(configs, 'warmup_freeze_steps', warmup_steps)
+            if warmup_freeze_steps > 0:
+                with FSDP.summon_full_params(parallel_model, writeback=True):
+                    for name, p in parallel_model.module.named_parameters():
+                        if not name.startswith("latent_termination_head"):
+                            p.requires_grad = False
+                llm_frozen = True
+                if rank == 0:
+                    print(f"[Warmup freeze] LLM weights frozen for first {warmup_freeze_steps} steps. "
+                          f"Only training termination head.")
+
+            for step, batch in enumerate(train_dataloader):
                 # batch = dict(["input_ids", "attention_mask", "position_ids", "idx", "answer"])
                 # answer is list[int]
 
@@ -673,6 +736,15 @@ def main():
 
                 if step == 25:
                     best_accuracy = 0.0     # reset best accuracy to ensure model saves occur after the initial epochs
+
+                # Unfreeze LLM weights after warmup freeze period
+                if llm_frozen and step >= warmup_freeze_steps:
+                    with FSDP.summon_full_params(parallel_model, writeback=True):
+                        for name, p in parallel_model.module.named_parameters():
+                            p.requires_grad = True
+                    llm_frozen = False
+                    if rank == 0:
+                        print(f"[Warmup freeze] LLM weights unfrozen at step {step}. Full model now training.")
 
                 # Replace reference model every N steps
                 if (step + 1) % configs.ref_model_renewal_steps == 0:
@@ -690,6 +762,7 @@ def main():
                     print("Reference model loaded")
 
                 all_rewards = []
+                all_base_rewards = []
                 all_outputs = []
                 all_token_ids = []
                 all_correct = 0
@@ -739,17 +812,20 @@ def main():
                     del model_outputs
 
                     # Compute rewards
-                    rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
+                    rewards, base_rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
                         generated,
                         tokenizer,
                         answers,
                         latent_id,
                         length_penalty=configs.length_penalty_per_token,
+                        format_penalty=getattr(configs, 'format_penalty', -0.5),
+                        latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
                         coconut_mode=configs.coconut,
                     )
 
                     # Append for batched processing
                     all_rewards.extend(rewards)
+                    all_base_rewards.extend(base_rewards)
                     all_outputs.append(embeddings.cpu())  # offload to CPU to free GPU VRAM between rollouts
                     all_token_ids.append(generated)
                     all_correct += sum(accuracies)
@@ -761,6 +837,7 @@ def main():
                     if wandb_run and rank == 0:
                         log_dict = {
                             "train/batch_avg_reward": avg_reward,
+                            "train/batch_avg_base_reward": sum(base_rewards) / len(base_rewards),
                             "train/batch_accuracy": step_accuracy,
                             "train/batch_n_latent_avg": avg_n_latent_last_batch,
                             "train/batcn_n_latent_correct_avg": sum(n_latents_correct)/len(n_latents_correct) if len(n_latents_correct) > 0 else 0,
@@ -822,6 +899,7 @@ def main():
                 
 
                 # aggregate into tensors for easier indexing
+                all_rewards_raw = list(all_rewards)  # save before tensor conversion for diagnostics
                 with torch.no_grad():
                     all_outputs     = torch.cat(all_outputs)            # (N * num_rollouts, L, hidden)
                     all_token_ids   = torch.cat(all_token_ids)        # (N * num_rollouts, L)
@@ -837,7 +915,7 @@ def main():
                 # Ref model log-probs — all at once on CPU, no gradient needed.
                 with torch.no_grad():
                     ref_model.eval()
-                    ref_outputs = ref_model(input_embeds=all_outputs)  # all_outputs already on CPU
+                    ref_outputs = ref_model(input_embeds=all_outputs, gen_token_ids=token_ids.cpu())  # all_outputs already on CPU
                     ref_lp_per_token, ref_loss_mask = compute_log_probs(
                         token_ids.cpu(), ref_outputs, len_question, latent_id, tokenizer.eos_token_id
                     )
@@ -852,6 +930,16 @@ def main():
                 total_nonmasked = ref_loss_mask.sum().clamp(min=1)
                 max_log_ratio   = torch.tensor(0.0, device=rank)
                 step_loss       = 0.0
+
+                # Diagnostic accumulators: decompose log-ratio by latent vs text positions
+                diag_latent_lr_sum  = torch.tensor(0.0, device=rank)
+                diag_latent_lr_max  = torch.tensor(0.0, device=rank)
+                diag_latent_count   = torch.tensor(0, dtype=torch.long, device=rank)
+                diag_text_lr_sum    = torch.tensor(0.0, device=rank)
+                diag_text_lr_max    = torch.tensor(0.0, device=rank)
+                diag_text_count     = torch.tensor(0, dtype=torch.long, device=rank)
+                diag_kl_loss_sum    = torch.tensor(0.0, device=rank)
+                diag_policy_loss_sum = torch.tensor(0.0, device=rank)
 
                 optimizer.zero_grad()
 
@@ -868,7 +956,7 @@ def main():
                     mb_ref_lp   = ref_lp_per_token[mb_start:mb_end]
                     mb_ref_mask = ref_loss_mask[mb_start:mb_end]
 
-                    mb_new_outputs = parallel_model(input_embeds=mb_embeds)
+                    mb_new_outputs = parallel_model(input_embeds=mb_embeds, gen_token_ids=mb_tok)
                     mb_new_lp, _   = compute_log_probs(
                         mb_tok, mb_new_outputs, len_question, latent_id, tokenizer.eos_token_id
                     )
@@ -892,6 +980,27 @@ def main():
                     mb_loss.backward()
                     step_loss    += mb_loss.item()
                     max_log_ratio = torch.max(max_log_ratio, mb_log_ratio.detach().abs().max())
+
+                    # Diagnostic: separate KL vs policy loss contributions
+                    with torch.no_grad():
+                        diag_policy_loss_sum += (mb_policy_loss * mb_ref_mask).sum() / total_nonmasked
+                        diag_kl_loss_sum     += (configs.kl_beta * mb_kl * mb_ref_mask).sum() / total_nonmasked
+
+                    # Diagnostic: decompose log-ratios by latent vs text positions
+                    with torch.no_grad():
+                        mb_gen = mb_tok[:, len_question:]                         # (mb, gen_len)
+                        mb_is_latent = (mb_gen == latent_id) & mb_ref_mask        # (mb, gen_len)
+                        mb_is_text   = (~(mb_gen == latent_id)) & mb_ref_mask
+                        mb_lr_abs    = mb_log_ratio.detach().abs()
+
+                        if mb_is_latent.any():
+                            diag_latent_lr_sum  += mb_lr_abs[mb_is_latent].sum()
+                            diag_latent_lr_max   = torch.max(diag_latent_lr_max, mb_lr_abs[mb_is_latent].max())
+                            diag_latent_count   += mb_is_latent.sum()
+                        if mb_is_text.any():
+                            diag_text_lr_sum    += mb_lr_abs[mb_is_text].sum()
+                            diag_text_lr_max     = torch.max(diag_text_lr_max, mb_lr_abs[mb_is_text].max())
+                            diag_text_count     += mb_is_text.sum()
 
                 all_losses.append(step_loss)
                 parallel_model.clip_grad_norm_(max_norm=1.0)
@@ -919,6 +1028,20 @@ def main():
                         "train/loss": total_loss,
                         "train/learning_rate": optimizer.param_groups[0]['lr'],
                         "train/max_log_ratio": max_log_ratio.item(),
+                        "train/llm_frozen": 1.0 if llm_frozen else 0.0,
+                        # Diagnostic: log-ratio decomposition
+                        "diag/latent_max_log_ratio": diag_latent_lr_max.item(),
+                        "diag/latent_mean_log_ratio": (diag_latent_lr_sum / diag_latent_count.clamp(min=1)).item(),
+                        "diag/text_max_log_ratio": diag_text_lr_max.item(),
+                        "diag/text_mean_log_ratio": (diag_text_lr_sum / diag_text_count.clamp(min=1)).item(),
+                        # Diagnostic: KL vs policy loss decomposition
+                        "diag/policy_loss": diag_policy_loss_sum.item(),
+                        "diag/kl_loss": diag_kl_loss_sum.item(),
+                        "diag/kl_to_policy_ratio": (diag_kl_loss_sum / diag_policy_loss_sum.abs().clamp(min=1e-8)).item(),
+                        # Diagnostic: reward sparsity (fraction of rollouts with zero or negative reward)
+                        "diag/zero_reward_frac": sum(1 for r in all_rewards_raw if r <= 0) / max(len(all_rewards_raw), 1),
+                        "diag/zero_base_reward_frac": sum(1 for r in all_base_rewards if r <= 0) / max(len(all_base_rewards), 1),
+                        "diag/step_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
                     }
                     wandb_run.log(log_dict)
 
@@ -974,12 +1097,14 @@ def main():
                             del model_outputs
 
                             # Compute rewards
-                            rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
+                            rewards, base_rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
                                 generated,
                                 tokenizer,
                                 answers,
                                 latent_id,
                                 length_penalty=configs.length_penalty_per_token,
+                                format_penalty=getattr(configs, 'format_penalty', -0.5),
+                                latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
                                 coconut_mode=configs.coconut,
                             )
                             all_correct += sum(accuracies)
@@ -1113,6 +1238,7 @@ def main():
                             max_new_tokens=max_new_tokens,
                             output_embedding=True,
                             synced_gpus=True,
+                            term_temperature=0.0,
                         )
                 else:
                     with FSDP.summon_full_params(parallel_model):
@@ -1128,12 +1254,14 @@ def main():
                 del model_outputs
 
                 # Compute rewards
-                rewards, step_accuracy, ans, correctness, n_latents, n_latents_correct = compute_reward(
+                rewards, base_rewards, step_accuracy, ans, correctness, n_latents, n_latents_correct = compute_reward(
                     generated,
                     tokenizer,
                     answers,
                     latent_id,
                     length_penalty=configs.length_penalty_per_token,
+                    format_penalty=getattr(configs, 'format_penalty', -0.5),
+                    latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
                     coconut_mode=configs.coconut,
                 )
                 all_correct += sum(correctness)

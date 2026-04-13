@@ -12,6 +12,46 @@ Outputs = namedtuple("Outputs", ["loss", "output_embeds", "inputs_embeds", "logi
 MAX_N_LATENT = 8
 
 
+class DifferentialTerminationHead(nn.Module):
+    """Termination head that uses current hidden state, EMA of previous states,
+    and the step-wise change (last_hidden - current_hidden) to decide whether
+    to continue latent reasoning.
+
+    The step-wise diff captures how much the hidden state changed from the
+    previous step.  When diff → 0, the model has converged and further latent
+    steps add no new information.
+    """
+    def __init__(self, hidden_size, bottleneck_ratio=4, ema_decay=0.9):
+        super().__init__()
+        self.ema_decay = ema_decay
+        bottleneck = hidden_size // bottleneck_ratio
+        # Input: [current_hidden; running_mean; last_hidden - current_hidden]
+        self.head = nn.Sequential(
+            nn.Linear(hidden_size * 3, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, 2),
+        )
+        self.last_hidden = None  # cached for step-by-step generation
+
+    def forward(self, current_hidden, running_mean, last_hidden=None):
+        """
+        current_hidden: (..., hidden_size)
+        running_mean:   (..., hidden_size) — same shape as current_hidden
+        last_hidden:    (..., hidden_size) — previous step's hidden state.
+                        Falls back to self.last_hidden, then to current_hidden (diff=0).
+        Returns: (..., 2) logits for [text, latent]
+        """
+        if last_hidden is None:
+            last_hidden = self.last_hidden if self.last_hidden is not None else current_hidden
+        diff = last_hidden - current_hidden
+        features = torch.cat([current_hidden, running_mean, diff], dim=-1)
+        return self.head(features)
+
+    def update_ema(self, running_mean, current_hidden):
+        """Update EMA in-place. Returns new running_mean (detached)."""
+        return self.ema_decay * running_mean + (1.0 - self.ema_decay) * current_hidden.detach()
+
+
 class Coconut(nn.Module):
 
     def __init__(
@@ -22,6 +62,8 @@ class Coconut(nn.Module):
         end_latent_id,
         eos_token_id,
         termination_gamma,
+        ema_decay=0.9,
+        bottleneck_ratio=4,
     ):
 
         super(Coconut, self).__init__()
@@ -45,14 +87,13 @@ class Coconut(nn.Module):
 
         self.kv_cache = None
 
-        # Latent Termination Head
+        # Differential EMA Termination Head
         self.termination_gamma = termination_gamma  # hyperparameter for loss
-        self.latent_termination_head = nn.Linear(self.base_causallm.config.hidden_size, 2, dtype=torch.bfloat16)      # May not work for some models, need checking
-        # self.latent_termination_head = nn.Sequential(
-        #     nn.Linear(self.base_causallm.config.hidden_size, self.base_causallm.config.hidden_size // 4), 
-        #     nn.GELU(),
-        #     nn.Linear(self.base_causallm.config.hidden_size //4, 2)
-        #     ) 
+        self.latent_termination_head = DifferentialTerminationHead(
+            self.base_causallm.config.hidden_size,
+            bottleneck_ratio=bottleneck_ratio,
+            ema_decay=ema_decay,
+        )
 
         # tested with GPT2 and Llama3
         if isinstance(self.base_causallm, GPT2LMHeadModel):
@@ -108,8 +149,10 @@ class Coconut(nn.Module):
                 for k, v in kv_cache
             ]
 
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, input_embeds=None, labels=None, reset_kv_cache=False, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, input_embeds=None, labels=None, reset_kv_cache=False, gen_token_ids=None, **kwargs):
         # In training settings, input_ids would be tensor of shape (batch_size, padded_len)
+        # gen_token_ids: optional (B, L) token IDs for the input_embeds path, used to compute
+        #                proper EMA running_mean for latent positions during GRPO policy forward.
         assert input_ids is not None or input_embeds is not None, "Input IDs or Input Embeds must be given"
 
         if reset_kv_cache:
@@ -226,7 +269,45 @@ class Coconut(nn.Module):
 
             logits = torch.cat(logits_list, dim=-2)                  # B, L, vocab_size
 
-            termination_logits = self.latent_termination_head(hidden_states_total)       # B, L, 2
+            # Build last_hidden and running_mean for the differential termination head.
+            # Non-latent positions: last_hidden = current (diff=0), running_mean = current.
+            # Latent positions: last_hidden = previous position's hidden state,
+            #                   running_mean = EMA across the latent chain.
+            last_hidden_total = hidden_states_total.clone()       # (B, L, hidden)
+            running_mean_total = hidden_states_total.clone()      # (B, L, hidden)
+
+            if max_n_latents > 0:
+                ema_decay = self.latent_termination_head.ema_decay
+                B = input_ids.shape[0]
+                L = input_ids.shape[1]
+                batch_range = torch.arange(B, device=input_ids.device)
+
+                # 1. Mask of latent positions
+                latent_mask = (input_ids == self.latent_token_id)          # (B, L)
+                has_latent = latent_mask.any(dim=1)                        # (B,)
+                lat_counts = latent_mask.sum(dim=1)                        # (B,)
+                first_lat = latent_mask.long().argmax(dim=1)               # (B,) — first latent col per sample
+
+                # 2-4. last_hidden at latent positions = hidden state at (position - 1)
+                lat_pos = latent_mask.nonzero()                            # (N, 2) [batch, seq]
+                if lat_pos.numel() > 0:
+                    b_idx, s_idx = lat_pos[:, 0], lat_pos[:, 1]
+                    prev_s_idx = (s_idx - 1).clamp(min=0)
+                    last_hidden_total[b_idx, s_idx] = hidden_states_total[b_idx, prev_s_idx].detach()
+
+                # 5. Running mean via EMA — loop over latent steps (small: 6-12), not batch
+                #    Latent positions are contiguous, so first_lat + step gives each position.
+                seed_pos = (first_lat - 1).clamp(min=0)                    # (B,)
+                ema = hidden_states_total[batch_range, seed_pos].detach()   # (B, hidden)
+                for step in range(max_n_latents):
+                    pos = (first_lat + step).clamp(max=L - 1)              # (B,)
+                    valid = has_latent & (lat_counts > step)               # (B,)
+                    h = hidden_states_total[batch_range, pos].detach()      # (B, hidden)
+                    ema = torch.where(valid.unsqueeze(-1), ema_decay * ema + (1.0 - ema_decay) * h, ema)
+                    running_mean_total[batch_range[valid], pos[valid]] = ema[valid]
+
+            # 6. Termination head inference
+            termination_logits = self.latent_termination_head(hidden_states_total, running_mean_total, last_hidden_total)  # B, L, 2
 
             # Only compute loss when labels are provided (i.e., during training).
             # Skips the expensive cross-entropy during generation, avoiding a
@@ -260,13 +341,45 @@ class Coconut(nn.Module):
 
             return Outputs(loss=loss, inputs_embeds=inputs_embeds, output_embeds=hidden_states_total, logits=logits, termination_logits=termination_logits, termination_labels=termination_labels, past_key_values=final_kv_cache)
 
-        else:           # Only for generation
-            # Use _forward_base to avoid output_hidden_states=True (Change 4)
+        else:           # Only for generation / GRPO policy forward
             logits, hidden_states, kv_cache = self._forward_base(inputs_embeds=input_embeds)
 
             self.kv_cache = kv_cache
 
-            termination_logits = self.latent_termination_head(hidden_states)
+            # Build last_hidden and running_mean for differential termination head
+            last_hidden = hidden_states.clone()      # default: current (diff=0)
+            running_mean = hidden_states.clone()     # default: current (non-latent)
+
+            if gen_token_ids is not None:
+                ema_decay = self.latent_termination_head.ema_decay
+                B = gen_token_ids.shape[0]
+                L = gen_token_ids.shape[1]
+                is_latent = (gen_token_ids == self.latent_token_id)  # (B, L)
+                has_latent = is_latent.any(dim=1)                    # (B,)
+
+                if has_latent.any():
+                    batch_range = torch.arange(B, device=gen_token_ids.device)
+                    lat_counts = is_latent.sum(dim=1)                          # (B,)
+                    first_lat = is_latent.long().argmax(dim=1)                 # (B,)
+                    max_lat_count = lat_counts.max().item()
+
+                    # last_hidden at latent positions = previous position's hidden state
+                    lat_pos = is_latent.nonzero()                              # (N, 2)
+                    if lat_pos.numel() > 0:
+                        b_idx, s_idx = lat_pos[:, 0], lat_pos[:, 1]
+                        last_hidden[b_idx, s_idx] = hidden_states[b_idx, (s_idx - 1).clamp(min=0)].detach()
+
+                    # Running mean via EMA (contiguous latent positions: first_lat + step)
+                    seed_pos = (first_lat - 1).clamp(min=0)
+                    ema = hidden_states[batch_range, seed_pos].detach()         # (B, hidden)
+                    for step in range(max_lat_count):
+                        pos = (first_lat + step).clamp(max=L - 1)              # (B,)
+                        valid = has_latent & (lat_counts > step)               # (B,)
+                        h = hidden_states[batch_range, pos].detach()            # (B, hidden)
+                        ema = torch.where(valid.unsqueeze(-1), ema_decay * ema + (1.0 - ema_decay) * h, ema)
+                        running_mean[batch_range[valid], pos[valid]] = ema[valid]
+
+            termination_logits = self.latent_termination_head(hidden_states, running_mean, last_hidden)
             return Outputs(loss=None, output_embeds=hidden_states, inputs_embeds=input_embeds, logits=logits,
                         termination_logits=termination_logits, termination_labels=None, past_key_values=kv_cache)
 
@@ -330,7 +443,8 @@ class Coconut(nn.Module):
 
         # get other tokens
         for _ in range(max_new_tokens - 1):
-            outputs = self.forward(input_embeds=new_inputs_embeds)
+            gen_tids = torch.tensor(tokens, device=input_ids.device).view(1, -1)
+            outputs = self.forward(input_embeds=new_inputs_embeds, gen_token_ids=gen_tids)
             self.gen_forward_cnt += 1
 
             # Decide whether NEXT token is latent or not
@@ -413,6 +527,9 @@ class Coconut(nn.Module):
 
         inputs_embeds = outputs.inputs_embeds
         kv_cache = outputs.past_key_values  # Fix #1: save KV cache covering the full question
+        # Initialize EMA running_mean and last_hidden from the question's last hidden state
+        running_mean = outputs.output_embeds[:, -1, :].detach().clone()  # (B, hidden)
+        self.latent_termination_head.last_hidden = running_mean.clone()  # seed last_hidden for first gen step
         latent_decision = _sample_term_batched(outputs.termination_logits[:, -1, :])        # Decide whether next token is latent or not
         latent_decision = torch.where(in_latent_mode, latent_decision, torch.zeros_like(latent_decision))  # enforce no return to latent after text
         if forced_min_latents is not None:                                                   # force continuation for sequences below their minimum
@@ -453,7 +570,9 @@ class Coconut(nn.Module):
                 position_ids=pos_ids,
                 past_key_values=kv_cache,
             )
-            termination_logits = self.latent_termination_head(hidden_states)
+            # Termination head with EMA running_mean and stored last_hidden
+            current_h = hidden_states[:, -1, :]                                  # (B, hidden)
+            termination_logits = self.latent_termination_head(current_h, running_mean).unsqueeze(1)  # (B, 1, 2) — uses self.last_hidden
 
             # Decide whether NEXT token is latent or not
             latent_decision = _sample_term_batched(termination_logits[:, -1, :])
@@ -471,6 +590,10 @@ class Coconut(nn.Module):
             next_tokens = torch.where(is_terminated, self.pad_id, next_tokens)
             is_terminated = is_terminated | (next_tokens == self.eos_token_id)        # Update termination status for each sequence in the batch
             latent_step_count = latent_step_count + (next_tokens == self.latent_token_id).long()
+
+            # Update last_hidden and EMA running_mean
+            self.latent_termination_head.last_hidden = current_h.detach().clone()
+            running_mean = self.latent_termination_head.update_ema(running_mean, current_h)
 
             last_embed = next_embeds.unsqueeze(1)
             embed_list.append(last_embed)
@@ -492,6 +615,7 @@ class Coconut(nn.Module):
                 # _ = self.base_causallm(inputs_embeds=last_embed, past_key_values=kv_cache)
 
         self.kv_cache = None  # Fix #3: release KV cache after generation
+        self.latent_termination_head.last_hidden = None  # release stored state
 
         if output_embedding:
             # for analysis purpose

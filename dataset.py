@@ -265,6 +265,7 @@ def get_grpo_dataset(
     no_special_marker=False,
     shuffle=False,
     max_question_len=None,
+    num_samples=None,
 ):
     """
     Function for obtaining train/validation dataset for GRPO.
@@ -310,6 +311,8 @@ def get_grpo_dataset(
     )
     if shuffle:
         output = output.shuffle(seed=42)
+    if num_samples is not None and num_samples < len(output):
+        output = output.select(range(num_samples))
     return output
 
 

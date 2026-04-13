@@ -13,8 +13,11 @@ project: coconut-grpo-baseline
 save_path: checkpoints
 name: gsm-coconut-grpo-baseline
 
-only_eval: False
-# only_eval: True
+# only_eval: False
+only_eval: True
+
+forced_n_latent: 0
+# forced_n_latent: 6
 
 coconut: True
 cot: False
@@ -28,19 +31,26 @@ debug: False
 bf16: True
 save_only_improve: False
 model_id: Qwen/Qwen2.5-1.5B
-train_path: data/gsm_train.json
+# train_path: data/gsm_train.json
+# train_path: data/openmath2_augmented_math.json
+train_path: data/openmath2_augmented_gsm8k.json
 # train_path: data/svamp_gsm_hard_train.json
 # train_path: data/gsm_train_original.json        # changed to original because 400k is too many training data, now using only 8k
-# val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
-val_path: data/gsm_valid.json
+val_path: data/gsm_test.json                      # Using test script to see test accuracy every N steps
+# val_path: data/gsm_valid.json
 
-save_pca_figures: False
+save_pca_figures: False     # 13 + 221 + 49 + 193 = 476
 
 
 # Point to a trained SFT / curriculum checkpoint to start GRPO from.
 # Use "None" to start from the raw pre-trained model weights.
-# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260222_040229.pt       # for coconut start
-load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260328_152119.pt       # new model, eval at 20% initially
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229_msdonly.pt       # prev model(c=3), eval at 26.9% / 19.26% on baseline/grpo
+# load_model_path: checkpoints/gsm-coconut-grpo-baseline/260331_003750/ref_models/eval_best_model_1_1700_0.26.pt                # prev model(c=3)+GRPO, eval best at 19.94% on grpo.
+# load_model_path: checkpoints/gsm-coconut-grpo-baseline/260331_182910_termsampling_forced2x_smallerclip/checkpoint_1_260331_182910.pt  # (c=3)+GRPO+0.2clip, 23.81% eval, 21.53% on forced n=6
+# load_model_path: checkpoints/gsm-coconut-grpo-baseline/260401_025320/ref_models/eval_best_model_1_700_0.26.pt                          # (c=3)+GRPO+0.2clip on openmath2_augmented_math, 26.16% eval / 26.38% on forced n=6
+load_model_path: checkpoints/gsm-coconut-grpo-baseline/260401_150804_forced2x_gsm8kaug/ref_models/eval_best_model_1_400_0.23.pt        # (c=3)+GRPO+above on openmath2_augmented_gsm8k, 24.34% eval / 24.34% on forced n=6
+
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/checkpoint_21_260328_152119.pt       # new model(c=2), eval at 20% (both baseline & grpo)
 
 resume: 0
 reset_optimizer: False
@@ -52,23 +62,39 @@ batch_size_training: 4
 weight_decay: 0.01
 seed: 42
 dropout: 0.1
-max_new_tokens: 64
+max_new_tokens: 128
 # lr: !!float "1.0e-5"
 
 # Rewards & Loss hyperparameter
-length_penalty_per_token: 0.01   # previously 0.01, but seems to restrict n_latent to 6 regardless of the problem
-kl_beta: 0.01
-clip_ratio: 0.2
+length_penalty_per_token: 0.00   # previously 0.01, but seems to restrict n_latent to 6 regardless of the problem
+kl_beta: 0.02
+clip_ratio_lower_bound: 0.2
+clip_ratio_upper_bound: 0.28
+
+# Termination head temperature for rollout generation. (below 0.1 = greedy, 0.1 and above = sampling)
+# Induces variance in n_latent across rollouts, to allow exploration in latent head
+term_temperature: 1.0
+
+# Forced-rollout exploration (Approach C).
+# forced_rollout_fraction: fraction of num_rollouts per question that are forced to
+#   generate at least 2x the previous batch's average n_latent.
+# forced_latent_init: seed value for avg_n_latent_last_batch on step 0 (= 2x forced minimum).
+forced_rollout_fraction: 0.25
+forced_latent_init: 6
 
 # GRPO hyperparameters
-lr: !!float "5e-6"      # current best is at 3e-6, 5e-7 improvement speed is SLOW
+# lr: !!float "5e-6"      # current best is at 3e-6, 5e-7 improvement speed is SLOW
+lr: !!float "1e-5"
 # gradient_accumulation_steps: 4
-num_rollouts: 8
+num_rollouts: 16
 train_batch_size: 8     # previously 32       # may have to increase batch_size from 4, since inter-batch accuracy variability is still very very high
 train_minibatch_size: 16
-eval_batch_size: 16
-ref_model_renewal_steps: 200
-eval_per_steps: 100
+eval_batch_size: 1
 
-sdpa_attention: True
+num_steps: 2000
+warmup_steps: 100
+eval_per_steps: 100
+ref_model_renewal_steps: 100
+
+sdpa_attention: False
 grad_checkpointing: False

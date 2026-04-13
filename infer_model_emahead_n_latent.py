@@ -1,24 +1,17 @@
 """
-Inference script for the baseline Coconut model with forced variable-length latent steps.
+Inference script for the EMAHead Coconut model with forced variable-length latent steps.
 
 For each question in the validation set:
-  1. Generates answers with forced n_latent = 3..16 (14 runs via generate_batched_n),
-     recording correctness at each chain length.
-  2. Runs one "normal" generation via generate_batched() (greedy termination head) to
-     determine the latent length the head would naturally choose.
-  3. Runs generate_batched_n(num_latents=16, output_embedding=True) to collect the 16
-     latent hidden states for PCA.
-  4. Produces a 3-D PCA scatter plot of the 16-step chain, colour-coded by per-length
+  1. Generates answers with forced n_latent = 3..16 (14 runs), recording correctness at each.
+  2. Runs one "normal" generation (forced_min=3, greedy termination) to obtain the latent
+     length the termination head would choose.
+  3. Runs n=16 with output_embedding=True to collect the 16 latent hidden states.
+  4. Produces a 3-D PCA scatter plot showing the 16-step chain, color-coded by per-length
      correctness, with the "normal" termination point outlined in black dotted lines.
-  5. Saves plots under {save_path}/{project}/{YYmmdd_HHmmss}/plots/<subdir>/ where
-     <subdir> encodes both the normal-operation outcome and whether the n=3..16 chain
-     is "pure" or "mixed":
-       correct / correct_mixed
-       incorrect / incorrect_mixed
-       wrong_format / wrong_format_mixed
+  5. Saves plots under {save_path}/{project}/{YMD_hms}/plots/{correct|incorrect|wrong_format}/
 
 Usage:
-    python infer_model_n_latent.py args/gsm_vllr_coconut_baseline.yaml [--max_samples N]
+    python infer_model_emahead_n_latent.py args/gsm_vllr_grpo_emahead.yaml [--batch_size 64][--max_samples N] [--n_min 3] [--n_max 16]
 """
 
 import os
@@ -40,7 +33,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import bitsandbytes as bnb
 
-from coconut_baseline import Coconut
+from coconut_grpo_emahead import Coconut
+from dataset import get_dataset, get_grpo_dataset
 from utils import Config, set_seed
 
 
@@ -49,6 +43,7 @@ from utils import Config, set_seed
 # ---------------------------------------------------------------------------
 
 def extract_answer(text: str, eot_token: str = "<|endoftext|>") -> str:
+    """Return the numerical answer following the last '#' in *text*."""
     return text.split("#")[-1].replace(",", "").replace(eot_token, "").strip()
 
 
@@ -58,28 +53,33 @@ def check_single_output(generated_ids: torch.Tensor, tokenizer, ground_truth: st
     Check a single generated sequence for format violation and correctness.
 
     Returns:
-        is_correct       (bool)
+        is_correct      (bool)
         format_violation (bool)
         extracted_answer (str)
         num_latent       (int)
     """
     text = tokenizer.decode(generated_ids, skip_special_tokens=not coconut_mode)
     answer = extract_answer(text)
+
     num_latent = (generated_ids == latent_id).sum().item()
 
     format_violation = False
 
+    # 1. Latent markers leaked into text answer
     if "<|start-latent|>" in answer or "<|end-latent|>" in answer:
         format_violation = True
         answer = answer.replace("<|start-latent|>", "").replace("<|end-latent|>", "")
 
+    # 2. Empty / missing answer
     cleaned = answer.strip()
     if not cleaned or cleaned == "#":
         format_violation = True
 
+    # 3. No latent tokens (skipped reasoning)
     if num_latent == 0:
         format_violation = True
 
+    # 4. CoT steps leaked
     if "<<" in answer or ">>" in answer:
         format_violation = True
 
@@ -88,17 +88,147 @@ def check_single_output(generated_ids: torch.Tensor, tokenizer, ground_truth: st
 
 
 # ---------------------------------------------------------------------------
-# Batch collation (left-pad)
+# Custom PCA visualisation
+# ---------------------------------------------------------------------------
+
+def visualize_n_latent_pca(
+    latent_embeds_16: np.ndarray,
+    correctness_per_n: dict,          # {n: True/False/None} for n in 3..16; None = format violation
+    normal_n_latent: int,
+    output_path: str,
+    question: str,
+    answer_gt: str,
+    normal_answer: str,
+    normal_correct: bool,
+    normal_format_violation: bool,
+    n_min: int = 3,
+    n_max: int = 16,
+    verbose: bool = False,
+):
+    """
+    3-D PCA scatter plot for the n-latent experiment.
+
+    The 16-step chain (from the n=16 run) is shown.  Points are coloured:
+      - index 0           → green  (starting point)
+      - index 1           → grey   (n=2, untested)
+      - indices 2..15     → blue (correct) / red (incorrect) / orange (wrong format)
+    The "normal" termination point is additionally outlined with a black dotted circle.
+
+    Args:
+        latent_embeds_16 : (16, hidden_dim) numpy array
+        correctness_per_n: {n (int): True/False/None} for tested latent lengths
+        normal_n_latent  : latent count under normal (forced-min-3, greedy) operation
+        output_path      : full file path to save the figure
+        n_min / n_max    : tested range (3 / 16)
+    """
+    if latent_embeds_16.shape[0] < 3:
+        print(f"  [skip PCA] only {latent_embeds_16.shape[0]} latent steps — need ≥ 3")
+        return
+
+    # PCA → 3-D
+    pca = PCA(n_components=3)
+    pts = pca.fit_transform(latent_embeds_16)       # (16, 3)
+
+    if verbose:
+        total_var = sum(pca.explained_variance_ratio_)
+        print(f"  PCA explained variance: {total_var:.3f}")
+
+    fig = plt.figure(figsize=(11, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Draw connecting lines
+    for i in range(len(pts) - 1):
+        ax.plot(pts[i:i+2, 0], pts[i:i+2, 1], pts[i:i+2, 2],
+                color='grey', alpha=0.35, linewidth=2)
+
+    # Determine point colour for each latent step (1-indexed n)
+    colors = []
+    n_correct = 0
+    for n in range(1, n_max + 1):
+        if n == 1:
+            colors.append('green')   # starting point
+        elif n == 2:
+            colors.append('grey')    # untested (between start and min)
+        else:
+            result = correctness_per_n.get(n)
+            if result is None:
+                colors.append('orange')   # format violation
+            elif result:
+                colors.append('blue')     # correct
+                n_correct += 1
+            else:
+                colors.append('red')      # incorrect
+
+    output_filename, ext = os.path.splitext(output_path)
+    output_root, output_file = os.path.split(output_filename)
+    output_path = os.path.join(output_root, f"{n_correct / n_max:.2f}_{output_file}{ext}")
+
+    # Draw points (one per latent step)
+    for i, (pt, c) in enumerate(zip(pts, colors)):
+        n = i + 1
+        size = 120 if n == 1 else 70
+        ax.scatter(pt[0], pt[1], pt[2], c=c, s=size, alpha=0.85,
+                   zorder=5, edgecolors='none')
+
+    # Overlay black dotted circle for "normal" termination
+    norm_idx = normal_n_latent - 1   # 0-indexed
+    if 0 <= norm_idx < n_max:
+        npt = pts[norm_idx]
+        ax.scatter(npt[0], npt[1], npt[2],
+                   s=300, facecolors='none', edgecolors='black',
+                   linewidths=2, linestyles='dashed', zorder=6,
+                   label=f'Normal termination (n={normal_n_latent})')
+
+    # Legend
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=9, label='Start (n=1)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',  markersize=9, label='n=2 (untested)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',  markersize=9, label='Correct'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',   markersize=9, label='Incorrect'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='orange',markersize=9, label='Wrong format'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
+               markeredgecolor='black', markeredgewidth=2, markersize=12,
+               linestyle='dashed', label=f'Normal term. (n={normal_n_latent})'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
+
+    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=8)
+    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=8)
+    ax.set_zlabel(f'PC3 ({pca.explained_variance_ratio_[2]:.1%})', fontsize=8)
+
+    # Build title
+    normal_status = ('CORRECT' if normal_correct
+                     else ('WRONG FORMAT' if normal_format_violation else 'INCORRECT'))
+    ax.set_title(f'Latent Chain PCA  |  normal termination: n={normal_n_latent} → {normal_status}',
+                 fontsize=10)
+
+    # Text box below plot
+    q_short = (question[:120] + '…') if len(question) > 120 else question
+    text_str = (f"Q: {q_short}\n"
+                f"GT: {answer_gt}   |   Normal pred: {normal_answer}   |   Normal n_latent: {normal_n_latent}")
+    text_str = text_str.replace('$', r'\$')
+    fig.text(0.05, -0.04, text_str, fontsize=8, verticalalignment='top',
+             family='monospace', clip_on=False, wrap=True)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', pad_inches=0.3)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Batch collation
 # ---------------------------------------------------------------------------
 
 def collate_batch(questions_batch, tokenizer, start_id, device):
     """
-    Tokenise and left-pad a list of question dicts.
+    Tokenise and left-pad a list of question dicts so they can be fed as a
+    single (B, padded_len) tensor to the model.
 
     Returns:
-        input_ids      : (B, padded_len) long tensor
+        input_ids      : (B, padded_len) long tensor, left-padded
         attention_mask : (B, padded_len) long tensor
-        padded_len     : int — column index where generated tokens begin
+        padded_len     : int — shared column index where generated tokens begin
     """
     pad_id = tokenizer.eos_token_id
     all_tokens = [
@@ -113,118 +243,9 @@ def collate_batch(questions_batch, tokenizer, start_id, device):
         input_rows.append([pad_id] * pad + tokens)
         mask_rows.append([0] * pad + [1] * len(tokens))
 
-    input_ids      = torch.tensor(input_rows, dtype=torch.long, device=device)
-    attention_mask = torch.tensor(mask_rows,  dtype=torch.long, device=device)
+    input_ids      = torch.tensor(input_rows, dtype=torch.long,  device=device)
+    attention_mask = torch.tensor(mask_rows,  dtype=torch.long,  device=device)
     return input_ids, attention_mask, padded_len
-
-
-# ---------------------------------------------------------------------------
-# PCA visualisation
-# ---------------------------------------------------------------------------
-
-def visualize_n_latent_pca(
-    latent_embeds_16: np.ndarray,
-    correctness_per_n: dict,
-    normal_n_latent: int,
-    output_path: str,
-    question: str,
-    answer_gt: str,
-    normal_answer: str,
-    normal_correct: bool,
-    normal_format_violation: bool,
-    n_min: int = 3,
-    n_max: int = 16,
-    verbose: bool = False,
-):
-    """
-    3-D PCA scatter plot of the n_max-step latent chain.
-
-    Colouring:
-      index 0        → green  (starting anchor)
-      index 1        → grey   (n=2, untested gap)
-      index n_min-1+ → blue (correct) / red (incorrect) / orange (wrong format)
-    Black dotted circle marks the "normal" termination point.
-    """
-    if latent_embeds_16.shape[0] < 3:
-        print(f"  [skip PCA] only {latent_embeds_16.shape[0]} latent steps — need ≥ 3")
-        return
-
-    pca = PCA(n_components=3)
-    pts = pca.fit_transform(latent_embeds_16)
-
-    if verbose:
-        print(f"  PCA explained variance: {sum(pca.explained_variance_ratio_):.3f}")
-
-    fig = plt.figure(figsize=(11, 10))
-    ax = fig.add_subplot(111, projection='3d')
-
-    for i in range(len(pts) - 1):
-        ax.plot(pts[i:i+2, 0], pts[i:i+2, 1], pts[i:i+2, 2],
-                color='grey', alpha=0.35, linewidth=2)
-
-    colors = []
-    n_correct = 0
-    for n in range(1, n_max + 1):
-        if n == 1:
-            colors.append('green')
-        elif n < n_min:
-            colors.append('grey')
-        else:
-            result = correctness_per_n.get(n)
-            if result is None:
-                colors.append('orange')
-            elif result:
-                colors.append('blue')
-                n_correct += 1
-            else:
-                colors.append('red')
-
-    output_filename, ext = os.path.splitext(output_path)
-    output_root, fname = os.path.split(output_filename)
-    output_path = os.path.join(output_root, f"{n_correct/n_max:.2f}_{fname}{ext}")
-
-    for i, (pt, c) in enumerate(zip(pts, colors)):
-        ax.scatter(pt[0], pt[1], pt[2], c=c, s=(120 if i == 0 else 70),
-                   alpha=0.85, zorder=5, edgecolors='none')
-
-    norm_idx = normal_n_latent - 1
-    if 0 <= norm_idx < n_max:
-        npt = pts[norm_idx]
-        ax.scatter(npt[0], npt[1], npt[2],
-                   s=300, facecolors='none', edgecolors='black',
-                   linewidths=2, linestyles='dashed', zorder=6)
-
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='green',  markersize=9, label='Start (n=1)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='grey',   markersize=9, label=f'n<{n_min} (untested)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',   markersize=9, label='Correct'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='red',    markersize=9, label='Incorrect'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='orange', markersize=9, label='Wrong format'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
-               markeredgecolor='black', markeredgewidth=2, markersize=12,
-               linestyle='dashed', label=f'Normal term. (n={normal_n_latent})'),
-    ]
-    ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
-
-    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=8)
-    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=8)
-    ax.set_zlabel(f'PC3 ({pca.explained_variance_ratio_[2]:.1%})', fontsize=8)
-
-    normal_status = ('CORRECT' if normal_correct
-                     else ('WRONG FORMAT' if normal_format_violation else 'INCORRECT'))
-    ax.set_title(f'Latent Chain PCA  |  normal termination: n={normal_n_latent} → {normal_status}',
-                 fontsize=10)
-
-    q_short = (question[:120] + '…') if len(question) > 120 else question
-    text_str = (f"Q: {q_short}\n"
-                f"GT: {answer_gt}   |   Normal pred: {normal_answer}   |   Normal n_latent: {normal_n_latent}")
-    fig.text(0.05, -0.04, text_str.replace('$', r'\$'), fontsize=8,
-             verticalalignment='top', family='monospace', clip_on=False, wrap=True)
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight', pad_inches=0.3)
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +253,7 @@ def visualize_n_latent_pca(
 # ---------------------------------------------------------------------------
 
 def load_model_and_tokenizer(configs, device):
+    """Load the Coconut + EMAHead model from a checkpoint."""
     model_config = AutoConfig.from_pretrained(configs.model_id)
     model_config.attention_dropout = getattr(configs, 'dropout', 0.0)
 
@@ -255,6 +277,7 @@ def load_model_and_tokenizer(configs, device):
     start_id  = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id    = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
+    # Resize & initialise new token embeddings
     model.resize_token_embeddings(len(tokenizer))
     embeddings = model.get_input_embeddings()
     target_id  = tokenizer.convert_tokens_to_ids("<<")
@@ -262,12 +285,16 @@ def load_model_and_tokenizer(configs, device):
         embeddings.weight.data[token_id] = embeddings.weight.data[target_id].clone()
         model.lm_head.weight.data[token_id] = model.lm_head.weight.data[target_id].clone()
 
+    # Wrap in Coconut
     model = Coconut(
         model, latent_id, start_id, end_id,
         tokenizer.eos_token_id,
         getattr(configs, 'termination_gamma', 1.0),
+        ema_decay=getattr(configs, 'ema_decay', 0.9),
+        bottleneck_ratio=getattr(configs, 'bottleneck_ratio', 4),
     )
 
+    # Load checkpoint
     if configs.load_model_path != "None":
         saved = torch.load(configs.load_model_path, map_location='cpu')
         result = model.load_state_dict(saved["model_state_dict"], strict=False)
@@ -289,22 +316,21 @@ def load_model_and_tokenizer(configs, device):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Baseline Coconut inference with variable latent lengths"
-    )
+    parser = argparse.ArgumentParser(description="EMAHead Coconut inference with variable latent lengths")
     parser.add_argument("config_file", help="Path to YAML config file")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Maximum number of questions to evaluate")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Number of questions to process simultaneously (default: 8)")
     parser.add_argument("--max_new_tokens", type=int, default=None,
-                        help="Override max_new_tokens from config (default: 128)")
+                        help="Override max_new_tokens from config")
     parser.add_argument("--n_min", type=int, default=3,
                         help="Minimum forced latent length to test (default: 3)")
     parser.add_argument("--n_max", type=int, default=16,
                         help="Maximum forced latent length to test (default: 16)")
     args = parser.parse_args()
 
+    # ---- Config ----
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
     configs = Config(config_dict)
@@ -316,7 +342,8 @@ def main():
 
     batch_size     = args.batch_size
     max_new_tokens = args.max_new_tokens or getattr(configs, 'max_new_tokens', 128)
-    gen_budget     = max_new_tokens + n_max
+    # Add extra room for the latent tokens themselves (n_max tokens before text starts)
+    gen_budget = max_new_tokens + n_max
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  batch_size: {batch_size}")
@@ -324,15 +351,15 @@ def main():
     # ---- Output paths ----
     current_time = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
     save_path = getattr(configs, 'save_path', 'checkpoints')
-    project   = getattr(configs, 'project', 'coconut-baseline')
+    project   = getattr(configs, 'project', 'coconut-grpo-emahead')
     base_dir  = os.path.join(save_path, project, current_time, "plots")
     dirs = {
-        'correct':            os.path.join(base_dir, 'correct'),
-        'correct_mixed':      os.path.join(base_dir, 'correct_mixed'),
-        'incorrect':          os.path.join(base_dir, 'incorrect'),
-        'incorrect_mixed':    os.path.join(base_dir, 'incorrect_mixed'),
-        'wrong_format':       os.path.join(base_dir, 'wrong_format'),
-        'wrong_format_mixed': os.path.join(base_dir, 'wrong_format_mixed'),
+        'correct':             os.path.join(base_dir, 'correct'),
+        'correct_mixed':       os.path.join(base_dir, 'correct_mixed'),
+        'incorrect':           os.path.join(base_dir, 'incorrect'),
+        'incorrect_mixed':     os.path.join(base_dir, 'incorrect_mixed'),
+        'wrong_format':        os.path.join(base_dir, 'wrong_format'),
+        'wrong_format_mixed':  os.path.join(base_dir, 'wrong_format_mixed'),
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
@@ -347,12 +374,17 @@ def main():
         val_data = val_data[:args.max_samples]
 
     questions = [
-        {"question": d["question"], "answer": d["answer"].replace(",", "").strip(), "idx": i}
+        {
+            "question": d["question"],
+            "answer": d["answer"].replace(",", "").strip(),
+            "idx": i,
+        }
         for i, d in enumerate(val_data)
     ]
     print(f"Evaluating {len(questions)} questions in batches of {batch_size}, "
           f"n_latent = {n_min}..{n_max}")
 
+    # ---- Summary accumulators ----
     accuracy_by_n = {n: {"correct": 0, "total": 0} for n in range(n_min, n_max + 1)}
     normal_stats  = {
         "correct": 0, "correct_mixed": 0,
@@ -366,40 +398,46 @@ def main():
         for batch_start in tqdm(range(0, len(questions), batch_size),
                                 total=n_batches, desc="Batches"):
             batch = questions[batch_start : batch_start + batch_size]
-            actual_bs     = len(batch)
+            actual_bs = len(batch)
             answers_batch = [q["answer"] for q in batch]
 
-            # Left-pad the batch; all generated tokens start at padded_len
+            # Left-pad the batch; generated tokens for ALL samples start at padded_len.
             input_ids, attention_mask, padded_len = collate_batch(
                 batch, tokenizer, start_id, device
             )
 
             # ----------------------------------------------------------------
-            # 1) "Normal" operation: greedy termination head
+            # 1) "Normal" operation: forced_min=n_min, greedy termination
             # ----------------------------------------------------------------
+            forced_min_vec = torch.full((actual_bs,), n_min, dtype=torch.long, device=device)
             normal_tokens = model.generate_batched(
                 input_ids, attention_mask,
                 max_new_tokens=gen_budget,
                 output_embedding=False,
                 synced_gpus=False,
+                term_temperature=0.0,
+                forced_min_latents=forced_min_vec,
             )
 
-            normal_results = []
+            # Check each sample in the batch
+            normal_results = []  # list of (is_correct, fmt_viol, answer, n_latent)
             for i in range(actual_bs):
                 res = check_single_output(normal_tokens[i], tokenizer, answers_batch[i], latent_id)
                 normal_results.append(res)
+
             del normal_tokens
 
             # ----------------------------------------------------------------
-            # 2) Correctness sweep: one batched call per n
+            # 2) Correctness sweep: one call per n, whole batch at once
             # ----------------------------------------------------------------
+            # correctness_per_n_batch[i][n] = True/False/None
             correctness_per_n_batch = [{} for _ in range(actual_bs)]
 
             for n in range(n_min, n_max + 1):
                 tokens_n = model.generate_batched_n(
                     input_ids, attention_mask,
-                    num_latents=n,
                     max_new_tokens=gen_budget,
+                    num_latent=n,
                     output_embedding=False,
                     synced_gpus=False,
                 )
@@ -418,17 +456,18 @@ def main():
                 gc.collect()
 
             # ----------------------------------------------------------------
-            # 3) Full-chain embedding run: generate_batched_n(num_latents=n_max)
+            # 3) Full-chain embedding run with n = n_max (whole batch at once)
             # ----------------------------------------------------------------
-            tokens_max, all_embeds = model.generate_batched_n(
+            tokens_max, all_embeds, _ = model.generate_batched_n(
                 input_ids, attention_mask,
-                num_latents=n_max,
                 max_new_tokens=gen_budget,
+                num_latent=n_max,
                 output_embedding=True,
                 synced_gpus=False,
             )
 
-            # All samples share the same padded_len offset after left-padding
+            # After left-padding, generated tokens for every sample start at the
+            # same column index (padded_len).  Slice latent positions in one go.
             latent_embeds_batch = (
                 all_embeds[:, padded_len : padded_len + n_max, :]
                 .detach().cpu().float().numpy()
@@ -440,43 +479,45 @@ def main():
             gc.collect()
 
             # ----------------------------------------------------------------
-            # 4) PCA visualisation + mixed-dir routing
+            # 4) PCA visualisation — one plot per sample (CPU-bound, cheap)
             # ----------------------------------------------------------------
             for i in range(actual_bs):
-                q_idx    = batch[i]["idx"]
+                q_idx = batch[i]["idx"]
                 question = batch[i]["question"]
                 answer_gt = answers_batch[i]
 
                 normal_correct, normal_fmt_viol, normal_answer, normal_n_latent = normal_results[i]
-                normal_n_latent_clamped = max(1, min(normal_n_latent, n_max))
+                normal_n_latent_clamped = max(n_min, min(normal_n_latent, n_max))
 
-                chain = correctness_per_n_batch[i]
-                has_correct   = any(v is True  for v in chain.values())
+                chain = correctness_per_n_batch[i]   # {n: True/False/None}
+                has_correct  = any(v is True  for v in chain.values())
                 has_incorrect = any(v is False for v in chain.values())
-                has_format    = any(v is None  for v in chain.values())
+                has_format   = any(v is None   for v in chain.values())
 
                 if normal_fmt_viol:
-                    is_mixed   = has_correct or has_incorrect
+                    is_mixed = has_correct or has_incorrect
                     subdir_key = "wrong_format_mixed" if is_mixed else "wrong_format"
                 elif normal_correct:
-                    is_mixed   = has_incorrect or has_format
+                    is_mixed = has_incorrect or has_format
                     subdir_key = "correct_mixed" if is_mixed else "correct"
                 else:
-                    is_mixed   = has_correct or has_format
+                    is_mixed = has_correct or has_format
                     subdir_key = "incorrect_mixed" if is_mixed else "incorrect"
 
                 normal_stats[subdir_key] += 1
+                save_subdir = dirs[subdir_key]
 
-                latent_embeds = latent_embeds_batch[i]
+                latent_embeds = latent_embeds_batch[i]   # (n_max, hidden)
+
                 if latent_embeds.shape[0] < 3:
                     print(f"  Q{q_idx}: fewer than 3 latent embeds — skipping PCA")
                     continue
 
                 visualize_n_latent_pca(
                     latent_embeds_16=latent_embeds,
-                    correctness_per_n=chain,
+                    correctness_per_n=correctness_per_n_batch[i],
                     normal_n_latent=normal_n_latent_clamped,
-                    output_path=os.path.join(dirs[subdir_key], f"Q{q_idx:04d}_pca.png"),
+                    output_path=os.path.join(save_subdir, f"Q{q_idx:04d}_pca.png"),
                     question=question,
                     answer_gt=answer_gt,
                     normal_answer=normal_answer,
@@ -498,10 +539,10 @@ def main():
         print(f"{n:>10}  {s['correct']:>8}  {s['total']:>8}  {acc:>10.4f}")
 
     total = sum(normal_stats.values())
-    print("\nNormal operation (greedy termination head):")
+    print("\nNormal operation (forced_min=3, greedy):")
     for k, v in normal_stats.items():
         pct = 100.0 * v / total if total else 0
-        print(f"  {k:<20}: {v:4d}  ({pct:.1f}%)")
+        print(f"  {k:<14}: {v:4d}  ({pct:.1f}%)")
 
     print(f"\nPlots saved to: {base_dir}")
 

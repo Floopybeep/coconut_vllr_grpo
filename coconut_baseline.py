@@ -62,7 +62,7 @@ class Coconut(nn.Module):
             self.embedding.weight.data.copy_(model_embedding.weight.data)
             self.embedding.norm = nn.Identity()
             self.base_causallm.set_input_embeddings(self.embedding)
-            self.base_causallm.lm_head.weight = self.embedding.weight
+            # self.base_causallm.lm_head.weight = self.embedding.weight
 
     def _forward_base(self, inputs_embeds, attention_mask=None, position_ids=None, past_key_values=None):
         """Call base transformer directly and apply lm_head manually.
@@ -419,3 +419,212 @@ class Coconut(nn.Module):
             return torch.tensor(tokens).view(1, -1), new_inputs_embeds
         else:
             return torch.tensor(tokens).view(1, -1)
+
+    def generate_batched_n(
+        self,
+        input_ids,
+        attention_mask=None,
+        num_latents=6,
+        max_new_tokens=100,
+        output_embedding=False,
+        synced_gpus=False,
+        **kwargs
+    ):
+        """Batched generation with a fixed number of latent steps.
+
+        All sequences in the batch receive exactly *num_latents* forced latent
+        tokens, then greedy text generation until EOS or max_new_tokens.
+        Uses a KV-cache loop (O(T) per step) instead of the growing-embed
+        approach in generate_n (O(T²)).
+        """
+        batch_size = input_ids.shape[0]
+        self.gen_forward_cnt = 0
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+        # position_ids from attention_mask so left-padded inputs work correctly
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.clamp_(min=0)
+
+        # First pass: full question
+        inputs_embeds = self.embedding(input_ids)    # (B, question_len, hidden)
+        logits, hidden_states, kv_cache = self._forward_base(
+            inputs_embeds, attention_mask, position_ids
+        )
+
+        # First generated token
+        latent_count = 0
+        if num_latents > 0:
+            next_token_embed = hidden_states[:, -1, :]                          # (B, hidden)
+            next_tokens = torch.full(
+                (batch_size,), self.latent_token_id, dtype=torch.long, device=input_ids.device
+            )
+            latent_count = 1
+        else:
+            raw = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token_embed = self.embedding(raw)
+            next_tokens = raw
+
+        is_terminated = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        last_embed = next_token_embed.unsqueeze(1)                              # (B, 1, hidden)
+        embed_list = [inputs_embeds, last_embed]
+        tokens = torch.cat((input_ids, next_tokens.unsqueeze(1)), dim=1)
+        gen_mask = torch.cat(
+            [attention_mask, torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=input_ids.device)], dim=1
+        )
+        next_pos = attention_mask.sum(dim=1)                                    # (B,)
+
+        for _ in range(max_new_tokens - 1):
+            if is_terminated.all():
+                break
+            self.gen_forward_cnt += 1
+
+            logits, hidden_states, kv_cache = self._forward_base(
+                last_embed,
+                attention_mask=gen_mask,
+                position_ids=next_pos.unsqueeze(1),
+                past_key_values=kv_cache,
+            )
+
+            if latent_count < num_latents:
+                next_token_embed = hidden_states[:, -1, :]
+                next_tokens = torch.full(
+                    (batch_size,), self.latent_token_id, dtype=torch.long, device=input_ids.device
+                )
+                latent_count += 1
+            else:
+                raw = torch.argmax(logits[:, -1, :], dim=-1)
+                next_tokens = torch.where(
+                    is_terminated,
+                    torch.full_like(raw, self.eos_token_id),
+                    raw,
+                )
+                is_terminated = is_terminated | (next_tokens == self.eos_token_id)
+                next_token_embed = self.embedding(next_tokens)
+
+            last_embed = next_token_embed.unsqueeze(1)
+            embed_list.append(last_embed)
+            gen_mask = torch.cat(
+                [gen_mask, torch.ones(batch_size, 1, dtype=gen_mask.dtype, device=input_ids.device)], dim=1
+            )
+            next_pos = next_pos + 1
+            tokens = torch.cat((tokens, next_tokens.unsqueeze(1)), dim=1)
+
+        self.kv_cache = None
+        new_inputs_embeds = torch.cat(embed_list, dim=1)
+
+        if output_embedding:
+            return tokens, new_inputs_embeds
+        else:
+            return tokens
+
+    def generate_batched(
+        self,
+        input_ids,
+        attention_mask=None,
+        max_new_tokens=100,
+        output_embedding=False,
+        synced_gpus=False,
+        **kwargs
+    ):
+        """Batched generation using the termination head (greedy argmax).
+
+        Mirrors generate() but processes a full batch at once.
+        Once a sequence emits its first text token it is locked out of latent
+        mode for the remainder of generation.
+        """
+        batch_size = input_ids.shape[0]
+        self.gen_forward_cnt = 0
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=input_ids.device)
+
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.clamp_(min=0)
+
+        # First pass: full question
+        inputs_embeds = self.embedding(input_ids)    # (B, question_len, hidden)
+        logits, hidden_states, kv_cache = self._forward_base(
+            inputs_embeds, attention_mask, position_ids
+        )
+
+        # Greedy termination decision for the first generated token
+        in_latent_mode = torch.ones(batch_size, dtype=torch.bool, device=input_ids.device)
+        term_logits = self.latent_termination_head(hidden_states[:, -1, :])     # (B, 2)
+        latent_decision = torch.argmax(term_logits, dim=-1)                     # (B,) — 0=text, 1=latent
+        latent_decision = torch.where(in_latent_mode, latent_decision, torch.zeros_like(latent_decision))
+        in_latent_mode = in_latent_mode & (latent_decision == 1)
+
+        raw = torch.argmax(logits[:, -1, :], dim=-1)
+        next_token_embed = torch.where(
+            (latent_decision == 1).unsqueeze(-1),
+            hidden_states[:, -1, :],
+            self.embedding(raw),
+        )
+        next_tokens = torch.where(
+            latent_decision == 1,
+            torch.full_like(raw, self.latent_token_id),
+            raw,
+        )
+
+        is_terminated = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        last_embed = next_token_embed.unsqueeze(1)
+        embed_list = [inputs_embeds, last_embed]
+        tokens = torch.cat((input_ids, next_tokens.unsqueeze(1)), dim=1)
+        gen_mask = torch.cat(
+            [attention_mask, torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=input_ids.device)], dim=1
+        )
+        next_pos = attention_mask.sum(dim=1)
+
+        for _ in range(max_new_tokens - 1):
+            if is_terminated.all():
+                break
+            self.gen_forward_cnt += 1
+
+            logits, hidden_states, kv_cache = self._forward_base(
+                last_embed,
+                attention_mask=gen_mask,
+                position_ids=next_pos.unsqueeze(1),
+                past_key_values=kv_cache,
+            )
+
+            current_h = hidden_states[:, -1, :]                                 # (B, hidden)
+            term_logits = self.latent_termination_head(current_h)               # (B, 2)
+            latent_decision = torch.argmax(term_logits, dim=-1)
+            latent_decision = torch.where(in_latent_mode, latent_decision, torch.zeros_like(latent_decision))
+            in_latent_mode = in_latent_mode & (latent_decision == 1)
+
+            raw = torch.argmax(logits[:, -1, :], dim=-1)
+            next_token_embed = torch.where(
+                (latent_decision == 1).unsqueeze(-1),
+                current_h,
+                self.embedding(raw),
+            )
+            next_tokens = torch.where(
+                latent_decision == 1,
+                torch.full_like(raw, self.latent_token_id),
+                raw,
+            )
+            next_tokens = torch.where(
+                is_terminated,
+                torch.full_like(next_tokens, self.eos_token_id),
+                next_tokens,
+            )
+            is_terminated = is_terminated | (next_tokens == self.eos_token_id)
+
+            last_embed = next_token_embed.unsqueeze(1)
+            embed_list.append(last_embed)
+            gen_mask = torch.cat(
+                [gen_mask, torch.ones(batch_size, 1, dtype=gen_mask.dtype, device=input_ids.device)], dim=1
+            )
+            next_pos = next_pos + 1
+            tokens = torch.cat((tokens, next_tokens.unsqueeze(1)), dim=1)
+
+        self.kv_cache = None
+        new_inputs_embeds = torch.cat(embed_list, dim=1)
+
+        if output_embedding:
+            return tokens, new_inputs_embeds
+        else:
+            return tokens

@@ -1,0 +1,60 @@
+# Two-phase head training: dataset construction + balanced MLP training.
+#
+# Phase 1 builds a feature dataset from generation + correctness checking.
+# Phase 2 trains the head MLP on class-balanced features (no LLM forward).
+#
+# torchrun --nnodes 1 --nproc_per_node 1 run_grpo_emahead_headdataset.py args/gsm_vllr_grpo_emahead_headdataset.yaml
+
+project: coconut-grpo-emahead
+save_path: checkpoints
+name: gsm-headdataset-emahead
+
+only_eval: False
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+no_bot_tokens: False
+
+termination_gamma: 1.0
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+
+train_path: data/gsm_train.json
+val_path: data/gsm_test.json
+
+save_pca_figures: False
+
+# Pretrained Coconut checkpoint (LLM weights reused, head trained from scratch).
+load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229_msdonly.pt
+
+resume: 0
+seed: 42
+dropout: 0.0
+max_new_tokens: 128
+
+# EMA head architecture
+ema_decay: 0.9
+bottleneck_ratio: 4
+
+# Phase 1: Dataset construction
+# Set dataset_load_path to skip Phase 1 and load a pre-built dataset.
+dataset_load_path: "None"
+construction_steps: 2000       # number of dataloader batches to process
+train_batch_size: 64         # generation mini-batch size
+min_latent: 3                 # smallest N to try
+max_latent: 18                # largest N to try
+
+# Phase 2: Head MLP training
+head_train_epochs: 20         # epochs over the balanced feature dataset
+head_train_lr: !!float "1e-3"
+head_train_mb_size: 512       # mini-batch size for MLP training (fast, can be large)
+
+eval_batch_size: 64
+
+sdpa_attention: False
+grad_checkpointing: False

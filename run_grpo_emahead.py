@@ -14,14 +14,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import wandb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
-from coconut_grpo_baseline_manual import Coconut
+from coconut_grpo_emahead import Coconut
 from dataset import (
     get_dataset,
     get_grpo_dataset,
@@ -29,14 +25,13 @@ from dataset import (
 )
 
 import gc
+import time
 import copy
 import json
 import yaml
 import random
 import datetime
 import argparse
-import itertools
-import functools
 import bitsandbytes as bnb
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -44,6 +39,18 @@ from tqdm import tqdm
 from utils import Config, set_seed, visualize_latent_pca, save_latent_histogram
 
 import torch
+
+global_time = 0
+
+def start_timer():
+    global global_time
+    global_time = time.time()
+
+def measure_timer(out_str):
+    global global_time
+    cur_time = time.time()
+    print(f"[{cur_time - global_time:.2f}s] {out_str}")
+    global_time = cur_time
 
 def print_memory_breakdown(model, optimizer):
     """
@@ -85,6 +92,99 @@ def print_memory_breakdown(model, optimizer):
 # Usage: Call this inside your training loop after optimizer.step()
 # print_memory_breakdown(model, optimizer)
 
+
+def capture_rng_state(device):
+    state = {"cpu": torch.get_rng_state().clone()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state(device=device).clone().cpu()
+    return state
+
+
+def restore_rng_state(state, device):
+    torch.set_rng_state(state["cpu"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"], device=device)
+
+
+def assert_rollout_replay_embeddings_match(
+    replay_outputs,
+    rollout_embeddings,
+    atol=1e-5,
+    rtol=1e-4,
+):
+    # The replay may be longer than the rollout due to global right-padding of token_ids to max_len
+    # across all chunks. Only compare up to the rollout's actual length (causal attention ensures
+    # the prefix is unaffected by the extra padded steps that the replay runs beyond it).
+    rollout_len = rollout_embeddings.shape[1]
+    replay_len  = replay_outputs.inputs_embeds.shape[1]
+    if replay_outputs.inputs_embeds.shape[0] != rollout_embeddings.shape[0] or replay_outputs.inputs_embeds.shape[2] != rollout_embeddings.shape[2]:
+        raise AssertionError(
+            f"Replay embedding batch/hidden mismatch: {replay_outputs.inputs_embeds.shape} vs {rollout_embeddings.shape}"
+        )
+    if replay_len < rollout_len:
+        raise AssertionError(
+            f"Replay is shorter than rollout ({replay_len} < {rollout_len}) — unexpected"
+        )
+    replay_prefix = replay_outputs.inputs_embeds[:, :rollout_len, :]
+    if not torch.allclose(replay_prefix, rollout_embeddings, atol=atol, rtol=rtol):
+        diff = (replay_prefix - rollout_embeddings).abs()           # (B, L, H)
+        max_diff = diff.max().item()
+        # Find the worst-offending position and batch item
+        flat_idx = diff.reshape(-1).argmax().item()
+        B, L, H = diff.shape
+        b_idx = flat_idx // (L * H)
+        l_idx = (flat_idx % (L * H)) // H
+        h_idx = flat_idx % H
+        # Check whether divergence is in the prompt portion or generated portion
+        prompt_len_guess = rollout_embeddings.shape[1] - (replay_outputs.inputs_embeds.shape[1] - rollout_len)
+        prompt_diff  = diff[:, :prompt_len_guess, :].max().item() if prompt_len_guess > 0 else 0.0
+        gen_diff     = diff[:, prompt_len_guess:, :].max().item()  if prompt_len_guess < L else 0.0
+        # Check per-position: at which generated step does divergence first appear?
+        per_pos_max = diff.max(dim=0).values.max(dim=-1).values   # (L,)
+        first_bad = (per_pos_max > atol).nonzero(as_tuple=False)
+        first_bad_pos = first_bad[0].item() if first_bad.numel() > 0 else -1
+        raise AssertionError(
+            f"Replay embeddings diverged (max abs diff {max_diff:.6e})\n"
+            f"  Worst at: batch={b_idx}, pos={l_idx}, hidden={h_idx}\n"
+            f"  replay value={replay_prefix[b_idx, l_idx, h_idx].item():.4f}  "
+            f"rollout value={rollout_embeddings[b_idx, l_idx, h_idx].item():.4f}\n"
+            f"  Max diff in prompt portion (pos<{prompt_len_guess}): {prompt_diff:.6e}\n"
+            f"  Max diff in generated portion (pos>={prompt_len_guess}): {gen_diff:.6e}\n"
+            f"  First position with diff>{atol}: pos={first_bad_pos} "
+            f"({'prompt' if first_bad_pos < prompt_len_guess else 'generated'})"
+        )
+
+
+def test_rollout_replay_embeddings(
+    parallel_model,
+    prompt_ids,
+    attention_mask,
+    generated_ids,
+    rollout_embeddings,
+    rng_state,
+    device,
+    atol=1e-5,
+    rtol=1e-4,
+):
+    was_training = parallel_model.module.training
+    parallel_model.module.train()
+    restore_rng_state(rng_state, device)
+    with torch.no_grad():
+        replay_outputs = parallel_model(
+            input_ids=prompt_ids.to(device),
+            attention_mask=attention_mask.to(device),
+            replay_generated_ids=generated_ids.to(device),
+        )
+    assert_rollout_replay_embeddings_match(
+        replay_outputs,
+        rollout_embeddings.to(device),
+        atol=atol,
+        rtol=rtol,
+    )
+    if not was_training:
+        parallel_model.module.eval()
+    return replay_outputs
+
 # ---------------------------------------------------------------------------
 # Reward
 # ---------------------------------------------------------------------------
@@ -95,49 +195,74 @@ def extract_answer(text, eot_token):
 
 
 def compute_reward(generated_ids, tokenizer, ground_truth,
-                            latent_id, length_penalty=0.01, format_score_ratio=0.2, coconut_mode=True, is_print=False):
+                            latent_id, length_penalty=0.01, format_penalty=-0.5,
+                            latent_step_reward=0.0, coconut_mode=True, is_print=False):
     """
-    Combined reward balancing correctness and latent-chain efficiency.
-    80% correctness, 20% format score
+    Combined reward balancing correctness, format compliance, and latent usage.
+
+    Reward scale:
+        +1.0 + latent_step_reward * n_latent   correct answer, clean format
+        +0.0 + latent_step_reward * n_latent   wrong answer, clean format
+        format_penalty (default -0.5)           format violation
 
     Args:
         generated_ids: (B, L) tensor — full sequence including question tokens
         tokenizer:     tokenizer for decoding
         ground_truth:  expected answer string
         latent_id:     token id used for latent positions
+        format_penalty: negative reward for format violations
+        latent_step_reward: small positive reward per latent token (encourages exploration)
         coconut_mode:  whether to keep special tokens when decoding
 
     Returns:
         total_reward (list[float]), n_latent (list[int])
     """
-    total_reward, accuracies, extracted_answers = [], [], []
+    total_reward, base_reward, accuracies, extracted_answers = [], [], [], []
     n_latents, n_latents_correct = [], []
     for i in range(generated_ids.shape[0]):     # iterate across batch
         text = tokenizer.decode(generated_ids[i, :], skip_special_tokens=not coconut_mode)      # list of strings
         answer = extract_answer(text, "<|endoftext|>")
         extracted_answers.append(answer)
 
-        # Check for output format penalty
-        format_score = 1.0
-        if answer.find("<|start-latent|>") != -1 or answer.find("<|end-latent|>") != -1:
-            format_score = 0.0
+        num_latent = (generated_ids[i, :] == latent_id).sum().item()
+        n_latents.append(num_latent)
+
+        # Check for format violations (negative reward)
+        format_violation = False
+
+        # 1. Latent markers leaked into text answer
+        if "<|start-latent|>" in answer or "<|end-latent|>" in answer:
+            format_violation = True
             answer = answer.replace("<|start-latent|>", "").replace("<|end-latent|>", "")
 
-        # Compute answer score
-        correctness = 1.0 if answer == ground_truth[i] else 0.0               # for list of answers, given as [ans1, ans2, ...]
-        # correctness = 1.0 if answer == ground_truth else 0.0                    # batch["answer"] is a list of strings, so use [i] if not indexed before function
-        accuracies.append(correctness)
-        num_latent = (generated_ids[i, :] == latent_id).sum().item()
-        correctness = max(0, correctness - length_penalty * max(0, num_latent - 1))
-        if num_latent == 0:
-            correctness = 0.0
+        # 2. Empty or invalid answer (no parseable content after ###)
+        cleaned = answer.strip()
+        if not cleaned or cleaned == "#":
+            format_violation = True
 
-        n_latents.append(num_latent)
+        # 3. No latent tokens at all (model skipped reasoning entirely)
+        if num_latent == 0:
+            format_violation = True
+
+        # 4. CoT steps found during reasoning
+        if "<<" in answer or ">>" in answer:
+            format_violation = True
+
+        # Compute correctness (tracked separately for accuracy metric)
+        correctness = 1.0 if answer == ground_truth[i] else 0.0
+        accuracies.append(correctness)
+
+        # Compute reward
+        if format_violation:
+            reward_base = format_penalty
+        else:
+            reward_base = correctness - length_penalty * max(0, num_latent - 1)
+        reward = reward_base + (latent_step_reward * num_latent if not format_violation else 0.0)
+
         if answer == ground_truth[i]:
             n_latents_correct.append(num_latent)
 
-        # Count latent_id tokens in generated_ids
-        reward = max(0, (1 - format_score_ratio) * correctness + format_score_ratio * format_score)
+        base_reward.append(reward_base)
         total_reward.append(reward)
 
         if is_print:
@@ -145,10 +270,10 @@ def compute_reward(generated_ids, tokenizer, ground_truth,
             print(f"Predicted answer: '{answer}'")
             print(f"Ground truth: {ground_truth[i]}")
             print(reward, num_latent)
-    
+
     accuracy = sum(accuracies) / len(accuracies)
 
-    return total_reward, accuracy, extracted_answers, accuracies, n_latents, n_latents_correct
+    return total_reward, base_reward, accuracy, extracted_answers, accuracies, n_latents, n_latents_correct
 
 
 # ---------------------------------------------------------------------------
@@ -225,12 +350,20 @@ def compute_log_probs(token_ids, model_outputs, prompt_len, latent_id, pad_id):
     # Slice to generated positions BEFORE log_softmax to avoid materialising the question
     # portion of logits. Keep lm log-probs in bf16 until after the gather to halve peak
     # memory compared to a full (B, L, vocab) float32 tensor.
-    lm_logits_gen  = model_outputs.logits[:, prompt_len-1:-1, :]                               # (B, gen_len, vocab) bf16
+    gen_len = gen_tokens.shape[1]
+    needed_steps = prompt_len - 1 + gen_len
+    if model_outputs.logits.shape[1] < needed_steps or model_outputs.termination_logits.shape[1] < needed_steps:
+        raise ValueError(
+            f"Replay outputs are too short for log-prob computation: "
+            f"logits={model_outputs.logits.shape[1]}, term={model_outputs.termination_logits.shape[1]}, "
+            f"needed={needed_steps}"
+        )
+    lm_logits_gen  = model_outputs.logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]    # (B, gen_len, vocab) bf16
     lm_log_p_gen   = F.log_softmax(lm_logits_gen, dim=-1)                                      # (B, gen_len, vocab) bf16
     pred_token     = lm_log_p_gen.gather(-1, gen_tokens.unsqueeze(-1)).squeeze(-1).float()     # (B, gen_len) fp32
 
     # Termination logits are 2-class; float32 is cheap here.
-    term_logits_gen = model_outputs.termination_logits[:, prompt_len-1:-1, :]                  # (B, gen_len, 2)
+    term_logits_gen = model_outputs.termination_logits[:, prompt_len - 1 : prompt_len - 1 + gen_len, :]  # (B, gen_len, 2)
     pred_term       = F.log_softmax(term_logits_gen.float(), dim=-1)                           # (B, gen_len, 2) fp32
 
     pos_log_probs = torch.where(mask_latent, pred_term[:, :, 1], pred_token + pred_term[:, :, 0])
@@ -302,10 +435,8 @@ def aggregate_outputs(all_outputs, question_lens):
 
 
 def save_model(parallel_model, save_path):
-    with FSDP.summon_full_params(parallel_model, writeback=False, rank0_only=False):
-        state_dict = {k: v.detach().cpu().clone()
-        for k, v in parallel_model.module.state_dict().items()}
-
+    state_dict = {k: v.detach().cpu().clone()
+                  for k, v in parallel_model.module.state_dict().items()}
     torch.save({"model_state_dict": state_dict}, save_path)
     print(f"Saved model checkpoint at {save_path}!")
 
@@ -344,7 +475,7 @@ def main():
 
     if rank == 0:
         import shutil
-        for _src in [__file__, os.path.join(os.path.dirname(__file__), "coconut_grpo_baseline_manual.py"), os.path.join(os.path.dirname(__file__), "args", "gsm_vllr_grpo_coconut_baseline.yaml")]:
+        for _src in [__file__, os.path.join(os.path.dirname(__file__), "coconut_grpo_emahead.py"), os.path.join(os.path.dirname(__file__), "args", "gsm_vllr_grpo_emahead.yaml")]:
             shutil.copy2(_src, os.path.join(save_dir, os.path.basename(_src)))
 
     cur_ckpts = os.listdir(save_dir)
@@ -469,40 +600,26 @@ def main():
 
     if configs.coconut:
         ref_base_model = copy.deepcopy(model)
-        ref_model = Coconut(ref_base_model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
+        ref_model = Coconut(ref_base_model, latent_id, start_id, end_id, tokenizer.eos_token_id,
+                            configs.termination_gamma, ema_decay=configs.ema_decay, bottleneck_ratio=configs.bottleneck_ratio)
         if configs.bf16:
             ref_model = ref_model.to(dtype=torch.bfloat16)
-        ref_model = ref_model.to(device="cpu")
-        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
+        ref_model = ref_model.to(device=rank)
+        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id,
+                        configs.termination_gamma, ema_decay=configs.ema_decay, bottleneck_ratio=configs.bottleneck_ratio)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
+    print(f"Running DDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
-
-    llama_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
-        },
-    )
 
     if configs.bf16:
         model.to(torch.bfloat16)
 
     assert ref_model is not None, "ref_model is not defined"
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-
-    else:
-        parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank, use_orig_params=True
-        )
-
+    parallel_model = DDP(model, device_ids=[rank])
     del model
 
     if rank == 0:
@@ -520,9 +637,31 @@ def main():
     )
 
     if not configs.only_eval:
-        base_dataset_train = get_dataset(
-            configs.train_path, tokenizer, max_size=3200 if configs.debug else int(configs.num_steps * configs.train_batch_size * 1.5)
-        )
+        total_train_samples = 3200 if configs.debug else int(configs.num_steps * configs.train_batch_size * 1.5)
+
+        # Mixed dataset loading: primary (e.g. MATH) + secondary (e.g. GSM8K)
+        train_path_secondary = getattr(configs, 'train_path_secondary', 'None')
+        dataset_mix_ratio = getattr(configs, 'dataset_mix_ratio', 1.0)  # fraction from primary
+
+        if train_path_secondary != 'None' and dataset_mix_ratio < 1.0:
+            n_primary = int(total_train_samples * dataset_mix_ratio)
+            n_secondary = total_train_samples - n_primary
+
+            base_dataset_primary = get_dataset(configs.train_path, tokenizer, max_size=n_primary)
+            base_dataset_secondary = get_dataset(train_path_secondary, tokenizer, max_size=n_secondary)
+
+            from datasets import concatenate_datasets
+            base_dataset_train = concatenate_datasets([base_dataset_primary, base_dataset_secondary])
+
+            if rank == 0:
+                print(f"Mixed dataset: {len(base_dataset_primary)} from {configs.train_path} "
+                      f"+ {len(base_dataset_secondary)} from {train_path_secondary} "
+                      f"= {len(base_dataset_train)} total")
+            del base_dataset_primary, base_dataset_secondary
+        else:
+            base_dataset_train = get_dataset(
+                configs.train_path, tokenizer, max_size=total_train_samples
+            )
 
     # if "gsm" in configs.val_path:
     #     # max_new_tokens = 64                   # change
@@ -663,7 +802,7 @@ def main():
             # forced-rollout minimum (= 2x this value).  Seeded from configs.forced_latent_init.
             avg_n_latent_last_batch = float(configs.forced_latent_init)
 
-            for step, batch in enumerate(train_dataloader):     
+            for step, batch in enumerate(train_dataloader):
                 # batch = dict(["input_ids", "attention_mask", "position_ids", "idx", "answer"])
                 # answer is list[int]
 
@@ -674,6 +813,7 @@ def main():
                 if step == 25:
                     best_accuracy = 0.0     # reset best accuracy to ensure model saves occur after the initial epochs
 
+
                 # Replace reference model every N steps
                 if (step + 1) % configs.ref_model_renewal_steps == 0:
                     # Save current model
@@ -682,32 +822,34 @@ def main():
                     save_model(parallel_model, ref_model_path)
 
                     # Replace ref model weights
-                    with FSDP.summon_full_params(parallel_model, writeback=False, rank0_only=False):
-                        state_dict = {k: v.detach().cpu().clone()
-                                        for k, v in parallel_model.module.state_dict().items()}
+                    state_dict = {k: v.detach().clone()
+                                  for k, v in parallel_model.module.state_dict().items()}
                     ref_model.load_state_dict(state_dict, strict=False)
                     del state_dict
                     print("Reference model loaded")
 
                 all_rewards = []
-                all_outputs = []
+                all_base_rewards = []
                 all_token_ids = []
+                all_prompt_ids = []
+                all_prompt_masks = []
+                all_rollout_rng_states = []
                 all_correct = 0
                 all_total = 0
 
                 # Generate Rollouts ######################################################################################################################################################
                 # for i in range(configs.num_rollouts):
                 # Changed from generating batch_size * num_rollout to setting batch_size=1 and generating 16 rollouts per step. This is primarily due to GPU restrictions.
+                start_timer()   #timer
 
                 # Phase 1: Rollout
-                parallel_model.module.train()
-                # modify input to batch * num_rollouts, by repeating each input. Dropout will ensure different outputs.
-                # answers = batch["answer"]       # [ans1, ans2, ...]
-
+                parallel_model.module.train()       # enables dropout for diverse reasoning trajectories
+                
+                # modify input to batch * num_rollouts, by repeating each input
                 batch_len, len_question = batch["input_ids"].shape
                 batch["input_ids"] = torch.repeat_interleave(batch["input_ids"], configs.num_rollouts, dim=0)
                 batch["attention_mask"] = torch.repeat_interleave(batch["attention_mask"], configs.num_rollouts, dim=0)
-                answers = [ans for ans in batch["answer"] for _ in range(configs.num_rollouts)]
+                answers = [ans for ans in batch["answer"] for _ in range(configs.num_rollouts)]     # answers = batch["answer"]       # [ans1, ans2, ...]
 
                 blacklist = {"idx", "answer"}
                 batch = {
@@ -715,8 +857,7 @@ def main():
                 }
 
                 # Build forced-rollout minimum latent tensor.
-                # The last forced_rollout_fraction of rollouts per question are forced to
-                # generate at least 2x the previous batch's average n_latent.
+                # The last forced_rollout_fraction of rollouts per question are forced to generate at least 2x the previous batch's average n_latent.
                 num_forced_per_q = max(1, int(configs.num_rollouts * configs.forced_rollout_fraction))
                 forced_min = min(int(2 * avg_n_latent_last_batch), max_new_tokens - 8)              # cap at max_new_tokens - 8 to prevent context explosion
                 forced_min_latents_vec = torch.zeros(batch_len * configs.num_rollouts, dtype=torch.long, device=rank)
@@ -724,69 +865,112 @@ def main():
                     start_forced = q_idx * configs.num_rollouts + (configs.num_rollouts - num_forced_per_q)
                     forced_min_latents_vec[start_forced : (q_idx + 1) * configs.num_rollouts] = forced_min
 
-                # Feed input to model
-                with torch.no_grad():
-                    with FSDP.summon_full_params(parallel_model):
-                        generated, embeddings, model_outputs = parallel_model.module.generate_batched(
-                            batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
+                # policy_minibatch_size controls both rollout generation chunk size AND the
+                # policy backward minibatch size.  They must be equal: the RNG state is
+                # captured once per chunk, so the replay batch must be identical to the
+                # rollout batch (batch size affects per-step RNG consumption via dropout).
+                # Smaller values reduce backward VRAM at the cost of rollout throughput.
+                rollout_chunk_size = getattr(configs, 'policy_minibatch_size', configs.train_minibatch_size * 8)
+                n_latents_correct_sum = 0
+                n_latents_correct_num = 0
+
+                measure_timer("Batch prep") #timer
+
+                with torch.no_grad():       # Start generation
+                    for rollout_start in range(0, batch["input_ids"].shape[0], rollout_chunk_size):         # generate in mini-batches
+                        rollout_end = min(rollout_start + rollout_chunk_size, batch["input_ids"].shape[0])
+                        prompt_chunk = batch["input_ids"][rollout_start:rollout_end]
+                        attn_chunk = batch["attention_mask"][rollout_start:rollout_end]
+                        answers_chunk = answers[rollout_start:rollout_end]
+                        forced_min_chunk = forced_min_latents_vec[rollout_start:rollout_end]
+                        rng_state = capture_rng_state(rank)
+                        generated = parallel_model.module.generate_batched(
+                            prompt_chunk,
+                            attention_mask=attn_chunk,
                             max_new_tokens=max_new_tokens,
-                            output_embedding=True,
+                            output_embedding=False,
                             synced_gpus=True,
                             term_temperature=configs.term_temperature,
-                            forced_min_latents=forced_min_latents_vec,
+                            forced_min_latents=forced_min_chunk,
                         )
-                    del model_outputs
 
-                    # Compute rewards
-                    rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
-                        generated,
-                        tokenizer,
-                        answers,
-                        latent_id,
-                        length_penalty=configs.length_penalty_per_token,
-                        coconut_mode=configs.coconut,
-                    )
+                        rewards, base_rewards, step_accuracy, ans_chunk, accuracies, n_latents, n_latents_correct = compute_reward(
+                            generated,
+                            tokenizer,
+                            answers_chunk,
+                            latent_id,
+                            length_penalty=configs.length_penalty_per_token,
+                            format_penalty=getattr(configs, 'format_penalty', -0.5),
+                            latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
+                            coconut_mode=configs.coconut,
+                        )
 
-                    # Append for batched processing
-                    all_rewards.extend(rewards)
-                    all_outputs.append(embeddings.cpu())  # offload to CPU to free GPU VRAM between rollouts
-                    all_token_ids.append(generated)
-                    all_correct += sum(accuracies)
-                    all_total += len(accuracies)
+                        n_latents_correct_sum += sum(n_latents_correct)
+                        n_latents_correct_num += len(n_latents_correct)
 
-                    avg_reward = sum(rewards) / len(rewards)
-                    avg_n_latent_last_batch = sum(n_latents) / len(n_latents) if n_latents else avg_n_latent_last_batch
+                        all_rewards.extend(rewards)
+                        all_base_rewards.extend(base_rewards)
+                        all_token_ids.append(generated)
+                        all_prompt_ids.append(prompt_chunk)
+                        all_prompt_masks.append(attn_chunk)
+                        all_rollout_rng_states.append(rng_state)
+                        all_correct += sum(accuracies)
+                        all_total += len(accuracies)
+                    
+                    measure_timer("Rollout generation") #timer
+
+                    avg_reward = sum(all_rewards) / len(all_rewards)
+                    avg_n_latent_last_batch = sum(
+                        (token_ids == latent_id).sum().item() for token_ids in all_token_ids
+                    ) / max(len(all_rewards), 1)
 
                     if wandb_run and rank == 0:
                         log_dict = {
                             "train/batch_avg_reward": avg_reward,
-                            "train/batch_accuracy": step_accuracy,
+                            "train/batch_avg_base_reward": sum(all_base_rewards) / len(all_base_rewards),
+                            "train/batch_accuracy": all_correct / max(all_total, 1),
                             "train/batch_n_latent_avg": avg_n_latent_last_batch,
-                            "train/batcn_n_latent_correct_avg": sum(n_latents_correct)/len(n_latents_correct) if len(n_latents_correct) > 0 else 0,
+                            "train/batcn_n_latent_correct_avg": n_latents_correct_sum/n_latents_correct_num if n_latents_correct_num > 0 else 0,
                             "train/forced_min_latents": forced_min,
                         }
                         wandb_run.log(log_dict)
 
-
-                    # Log to file for debugging
+                    # Right-pad all_token_ids to the longest length before concatenating
+                    max_len = max(token_ids.shape[1] for token_ids in all_token_ids)
+                    padded_token_ids = []
+                    for token_ids in all_token_ids:
+                        pad_len = max_len - token_ids.shape[1]
+                        if pad_len > 0:
+                            padded = torch.nn.functional.pad(token_ids, (0, pad_len), value=tokenizer.eos_token_id)
+                        else:
+                            padded = token_ids
+                        padded_token_ids.append(padded)
+                    
+                    measure_timer("Pad and concat for logging") #timer
+                    
+                    generated_all = torch.cat(padded_token_ids, dim=0)
                     with open(log_path, "a") as f:
                         f.write(f"Step {step}, Average Reward: {avg_reward:.3f}\n")
 
                         for i in range(batch_len):
                             for j in range(configs.num_rollouts):
                                 idx_ans = i * configs.num_rollouts + j
-                                f.write(f"Question RAW: {tokenizer.decode(batch['input_ids'][idx_ans])}\n")
-                                f.write(f"Generated RAW: {tokenizer.decode(generated[idx_ans, len_question:])}\n")
-                                f.write(f"Question: {tokenizer.decode(batch['input_ids'][idx_ans]).replace("<|endoftext|>", "")}\n")
-                                f.write(f"Generated: {tokenizer.decode(generated[idx_ans, len_question:]).replace("<|endoftext|>", "")}\n")
-                                f.write(f"Predicted answer: '{ans[idx_ans]}'\n")
+                                decoded_question = tokenizer.decode(batch["input_ids"][idx_ans].cpu())
+                                decoded_generated = tokenizer.decode(generated_all[idx_ans, len_question:])
+                                f.write(f"Question RAW: {decoded_question}\n")
+                                f.write(f"Generated RAW: {decoded_generated}\n")
+                                f.write(f"Question: {decoded_question.replace('<|endoftext|>', '')}\n")
+                                f.write(f"Generated: {decoded_generated.replace('<|endoftext|>', '')}\n")
+                                f.write(f"Predicted answer: '{extract_answer(decoded_generated, tokenizer.eos_token)}'\n")
                                 f.write(f"Ground Truth: {answers[idx_ans]}\n")
-                                f.write(f"Reward: {rewards[idx_ans]:.2f}\n")
+                                f.write(f"Reward: {all_rewards[idx_ans]:.2f}\n")
                                 f.write("\n")
                             f.write("\n\n\n")
-                        
-                        f.write("\n" *5 + "-" * 100 + "\n" *5)
+
+                        f.write("\n" * 5 + "-" * 100 + "\n" * 5)
+                    del generated_all
+
+                    measure_timer("Finish logging") #timer
 
                 # Calculate overall accuracy, save model if better than previous best
                 overall_accuracy = all_correct / all_total
@@ -797,78 +981,81 @@ def main():
                 #         save_model(parallel_model, os.path.join(ref_save_dir, f"best_model_step{step}_{overall_accuracy:.2f}"))
 
                 # Policy ####################################################################################################################
-                # Start training step after accumulating rewards and log-probs (Deepseek-R1 style, N=16), Mini-batches
                 all_losses = []
+                all_rewards_raw = list(all_rewards)
+                prompt_ids_cpu = torch.cat(all_prompt_ids, dim=0).to(rank)
+                prompt_masks_cpu = torch.cat(all_prompt_masks, dim=0).to(rank)
 
-                # Append pad tokens to outputs/token_ids to match max length
-                max_len = max(out.shape[1] for out in all_outputs)
-                for i in range(len(all_outputs)):
-                    out = all_outputs[i]
-                    tid = all_token_ids[i]
-                    pad_len = max_len - out.shape[1]
-                    if pad_len > 0:
-                        emb_padding         = torch.zeros(out.shape[0], pad_len, out.shape[2], device=out.device, dtype=out.dtype)
-                        all_outputs[i]      = torch.cat([out, emb_padding], dim=1)
-                        id_padding          = torch.full((tid.shape[0], pad_len), tokenizer.eos_token_id, device=tid.device, dtype=tid.dtype)
-                        all_token_ids[i]    = torch.cat([tid, id_padding], dim=1)
-                    else:
-                        all_outputs[i]      = out
-                        all_token_ids[i]    = tid
+                # Reuse padded_token_ids already built for logging — no second pass needed.
+                token_ids_cpu = torch.cat(padded_token_ids, dim=0).to(rank)
+                token_ids = token_ids_cpu
+                all_rewards = torch.tensor(all_rewards, device=rank, dtype=torch.float32)
 
-                # pick 32 rollouts at a time, randomly sampling from the full set of rollouts
-                # Currently, for question A, B, C, D, the output layout is: (A1, B1, C1, D1), (A2, B2, C2, D2), ...
-                # total_indices = list(range(len(all_rewards)))
-                # random.shuffle(total_indices)
-                
-
-                # aggregate into tensors for easier indexing
-                with torch.no_grad():
-                    all_outputs     = torch.cat(all_outputs)            # (N * num_rollouts, L, hidden)
-                    all_token_ids   = torch.cat(all_token_ids)        # (N * num_rollouts, L)
-                    all_rewards     = torch.tensor(all_rewards, device=rank, dtype=torch.float32)
-
-                # Phase 2: Group-Normalised Advantages
                 advantages = (all_rewards - all_rewards.mean()) / (all_rewards.std() + 1e-8)
 
-                # Phase 3: GRPO Policy Loss (mini-batch gradient accumulation)
-                # all_outputs is already on CPU (offloaded during rollout); all_token_ids on GPU.
-                token_ids = all_token_ids.to(rank)
-
-                # Ref model log-probs — all at once on CPU, no gradient needed.
-                with torch.no_grad():
+                with torch.no_grad():       # Reference model rollout
                     ref_model.eval()
-                    ref_outputs = ref_model(input_embeds=all_outputs)  # all_outputs already on CPU
-                    ref_lp_per_token, ref_loss_mask = compute_log_probs(
-                        token_ids.cpu(), ref_outputs, len_question, latent_id, tokenizer.eos_token_id
-                    )
-                    del ref_outputs
-                    gc.collect()
-                    ref_lp_per_token = ref_lp_per_token.to(device=rank)
-                    ref_loss_mask    = ref_loss_mask.to(device=rank)
+                    ref_lp_chunks = []
+                    ref_mask_chunks = []
+                    for mb_start in range(0, token_ids_cpu.shape[0], rollout_chunk_size):
+                        mb_end = min(mb_start + rollout_chunk_size, token_ids_cpu.shape[0])
+                        ref_outputs = ref_model(
+                            input_ids=prompt_ids_cpu[mb_start:mb_end],
+                            attention_mask=prompt_masks_cpu[mb_start:mb_end],
+                            replay_generated_ids=token_ids_cpu[mb_start:mb_end],
+                        )
+                        ref_lp_chunk, ref_mask_chunk = compute_log_probs(
+                            token_ids[mb_start:mb_end],
+                            ref_outputs,
+                            len_question,
+                            latent_id,
+                            tokenizer.eos_token_id,
+                        )
+                        ref_lp_chunks.append(ref_lp_chunk)
+                        ref_mask_chunks.append(ref_mask_chunk)
+                        del ref_outputs
 
-                # Training forward in mini-batches; loss is normalised over ALL tokens globally.
-                total_rollouts  = all_outputs.shape[0]
-                train_mb_size   = configs.train_minibatch_size
+                    ref_lp_per_token = torch.cat(ref_lp_chunks, dim=0)
+                    ref_loss_mask = torch.cat(ref_mask_chunks, dim=0)
+                
+                measure_timer("Reference rollout")  #timer
+
+                total_rollouts  = token_ids.shape[0]
+                train_mb_size   = rollout_chunk_size
                 total_nonmasked = ref_loss_mask.sum().clamp(min=1)
                 max_log_ratio   = torch.tensor(0.0, device=rank)
                 step_loss       = 0.0
 
+                # Diagnostic accumulators: decompose log-ratio by latent vs text positions
+                diag_latent_lr_sum  = torch.tensor(0.0, device=rank)
+                diag_latent_lr_max  = torch.tensor(0.0, device=rank)
+                diag_latent_count   = torch.tensor(0, dtype=torch.long, device=rank)
+                diag_text_lr_sum    = torch.tensor(0.0, device=rank)
+                diag_text_lr_max    = torch.tensor(0.0, device=rank)
+                diag_text_count     = torch.tensor(0, dtype=torch.long, device=rank)
+                diag_kl_loss_sum    = torch.tensor(0.0, device=rank)
+                diag_policy_loss_sum = torch.tensor(0.0, device=rank)
+
                 optimizer.zero_grad()
 
-                # Switch to eval mode before computing log-probs to disable dropout (dropout mask changes if dropout is applied here)
-                parallel_model.module.eval()
-                # Compute in mini-batches to reduce peak VRAM usage, by deleting outputs frequently (only need log_probs for reward)
+                parallel_model.module.train()
                 for mb_start in range(0, total_rollouts, train_mb_size):
                     mb_end      = min(mb_start + train_mb_size, total_rollouts)
-                    mb_embeds   = all_outputs[mb_start:mb_end].to(rank)   # CPU → GPU for this mini-batch
-
+                    restore_rng_state(all_rollout_rng_states[mb_start // train_mb_size], rank)
+                    mb_prompt   = prompt_ids_cpu[mb_start:mb_end].to(rank)
+                    mb_mask     = prompt_masks_cpu[mb_start:mb_end].to(rank)
                     mb_tok      = token_ids[mb_start:mb_end]
                     mb_adv      = advantages[mb_start:mb_end]
 
                     mb_ref_lp   = ref_lp_per_token[mb_start:mb_end]
                     mb_ref_mask = ref_loss_mask[mb_start:mb_end]
 
-                    mb_new_outputs = parallel_model(input_embeds=mb_embeds)
+                    mb_new_outputs = parallel_model(
+                        input_ids=mb_prompt,
+                        attention_mask=mb_mask,
+                        replay_generated_ids=mb_tok,
+                        term_temperature=configs.term_temperature,
+                    )
                     mb_new_lp, _   = compute_log_probs(
                         mb_tok, mb_new_outputs, len_question, latent_id, tokenizer.eos_token_id
                     )
@@ -893,15 +1080,38 @@ def main():
                     step_loss    += mb_loss.item()
                     max_log_ratio = torch.max(max_log_ratio, mb_log_ratio.detach().abs().max())
 
+                    # Diagnostic: separate KL vs policy loss contributions
+                    with torch.no_grad():
+                        diag_policy_loss_sum += (mb_policy_loss * mb_ref_mask).sum() / total_nonmasked
+                        diag_kl_loss_sum     += (configs.kl_beta * mb_kl * mb_ref_mask).sum() / total_nonmasked
+
+                    # Diagnostic: decompose log-ratios by latent vs text positions
+                    with torch.no_grad():
+                        mb_gen = mb_tok[:, len_question:]                         # (mb, gen_len)
+                        mb_is_latent = (mb_gen == latent_id) & mb_ref_mask        # (mb, gen_len)
+                        mb_is_text   = (~(mb_gen == latent_id)) & mb_ref_mask
+                        mb_lr_abs    = mb_log_ratio.detach().abs()
+
+                        if mb_is_latent.any():
+                            diag_latent_lr_sum  += mb_lr_abs[mb_is_latent].sum()
+                            diag_latent_lr_max   = torch.max(diag_latent_lr_max, mb_lr_abs[mb_is_latent].max())
+                            diag_latent_count   += mb_is_latent.sum()
+                        if mb_is_text.any():
+                            diag_text_lr_sum    += mb_lr_abs[mb_is_text].sum()
+                            diag_text_lr_max     = torch.max(diag_text_lr_max, mb_lr_abs[mb_is_text].max())
+                            diag_text_count     += mb_is_text.sum()
+                
+                measure_timer("Policy Minibatch generation")
+
                 all_losses.append(step_loss)
-                parallel_model.clip_grad_norm_(max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(parallel_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 lr_scheduler.step()
 
                 total_loss = sum(all_losses) / len(all_losses)
 
                 # Free large rollout tensors accumulated this step
-                del all_outputs, all_token_ids, all_rewards
+                del token_ids_cpu, token_ids, prompt_ids_cpu, prompt_masks_cpu, all_token_ids, all_prompt_ids, all_prompt_masks, all_rewards
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -919,6 +1129,19 @@ def main():
                         "train/loss": total_loss,
                         "train/learning_rate": optimizer.param_groups[0]['lr'],
                         "train/max_log_ratio": max_log_ratio.item(),
+                        # Diagnostic: log-ratio decomposition
+                        "diag/latent_max_log_ratio": diag_latent_lr_max.item(),
+                        "diag/latent_mean_log_ratio": (diag_latent_lr_sum / diag_latent_count.clamp(min=1)).item(),
+                        "diag/text_max_log_ratio": diag_text_lr_max.item(),
+                        "diag/text_mean_log_ratio": (diag_text_lr_sum / diag_text_count.clamp(min=1)).item(),
+                        # Diagnostic: KL vs policy loss decomposition
+                        "diag/policy_loss": diag_policy_loss_sum.item(),
+                        "diag/kl_loss": diag_kl_loss_sum.item(),
+                        "diag/kl_to_policy_ratio": (diag_kl_loss_sum / diag_policy_loss_sum.abs().clamp(min=1e-8)).item(),
+                        # Diagnostic: reward sparsity (fraction of rollouts with zero or negative reward)
+                        "diag/zero_reward_frac": sum(1 for r in all_rewards_raw if r <= 0) / max(len(all_rewards_raw), 1),
+                        "diag/zero_base_reward_frac": sum(1 for r in all_base_rewards if r <= 0) / max(len(all_base_rewards), 1),
+                        "diag/step_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
                     }
                     wandb_run.log(log_dict)
 
@@ -962,24 +1185,25 @@ def main():
                                 key: batch[key].to(rank) for key in batch.keys() if key not in blacklist        # set tokenized text to device(the GPU that current code runs in - multi-GPU setting)
                             }
 
-                            with FSDP.summon_full_params(parallel_model):
-                                generated, embeddings, model_outputs = parallel_model.module.generate_batched(
-                                    batch["input_ids"],
-                                    attention_mask=batch["attention_mask"],
-                                    max_new_tokens=max_new_tokens,
-                                    output_embedding=True,
-                                    synced_gpus=True,
-                                    term_temperature=0.0
-                                )
+                            generated, embeddings, model_outputs = parallel_model.module.generate_batched(
+                                batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                max_new_tokens=max_new_tokens,
+                                output_embedding=True,
+                                synced_gpus=True,
+                                term_temperature=0.0
+                            )
                             del model_outputs
 
                             # Compute rewards
-                            rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
+                            rewards, base_rewards, step_accuracy, ans, accuracies, n_latents, n_latents_correct = compute_reward(
                                 generated,
                                 tokenizer,
                                 answers,
                                 latent_id,
                                 length_penalty=configs.length_penalty_per_token,
+                                format_penalty=getattr(configs, 'format_penalty', -0.5),
+                                latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
                                 coconut_mode=configs.coconut,
                             )
                             all_correct += sum(accuracies)
@@ -1106,34 +1330,35 @@ def main():
                 }
 
                 if configs.forced_n_latent == 0:
-                    with FSDP.summon_full_params(parallel_model):
-                        generated, embeddings, model_outputs = parallel_model.module.generate_batched(
-                            batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            max_new_tokens=max_new_tokens,
-                            output_embedding=True,
-                            synced_gpus=True,
-                        )
+                    generated, embeddings, model_outputs = parallel_model.module.generate_batched(
+                        batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        max_new_tokens=max_new_tokens,
+                        output_embedding=True,
+                        synced_gpus=True,
+                        term_temperature=0.0,
+                    )
                 else:
-                    with FSDP.summon_full_params(parallel_model):
-                        generated, embeddings, model_outputs = parallel_model.module.generate_batched_n(
-                            batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            max_new_tokens=max_new_tokens,
-                            num_latent=configs.forced_n_latent,
-                            output_embedding=True,
-                            synced_gpus=True,
-                        )
+                    generated, embeddings, model_outputs = parallel_model.module.generate_batched_n(
+                        batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        max_new_tokens=max_new_tokens,
+                        num_latent=configs.forced_n_latent,
+                        output_embedding=True,
+                        synced_gpus=True,
+                    )
 
                 del model_outputs
 
                 # Compute rewards
-                rewards, step_accuracy, ans, correctness, n_latents, n_latents_correct = compute_reward(
+                rewards, base_rewards, step_accuracy, ans, correctness, n_latents, n_latents_correct = compute_reward(
                     generated,
                     tokenizer,
                     answers,
                     latent_id,
                     length_penalty=configs.length_penalty_per_token,
+                    format_penalty=getattr(configs, 'format_penalty', -0.5),
+                    latent_step_reward=getattr(configs, 'latent_step_reward', 0.0),
                     coconut_mode=configs.coconut,
                 )
                 all_correct += sum(correctness)

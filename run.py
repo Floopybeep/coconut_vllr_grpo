@@ -182,11 +182,11 @@ def main():
     loaded = False
 
     if configs.load_model_path != "None":
-        saved_checkpoint = torch.load(
-            configs.load_model_path, map_location=torch.device(rank)
-        )
-        saved_weights = saved_checkpoint["model_state_dict"]
-        # saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
+        # saved_checkpoint = torch.load(
+        #     configs.load_model_path, map_location=torch.device(rank)
+        # )
+        # saved_weights = saved_checkpoint["model_state_dict"]
+        saved_weights = torch.load(configs.load_model_path, map_location=torch.device(rank))
 
         if configs.coconut and not any(
             [k.startswith("base_causallm") for k in saved_weights.keys()]
@@ -232,7 +232,7 @@ def main():
         configs.coconut = False
 
     if configs.coconut:
-        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id, configs.termination_gamma)
+        model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
@@ -569,7 +569,7 @@ def main():
                 batch = {
                     k: v.to(rank)
                     for k, v in batch.items()
-                    if v != None and k not in ["idx", "position_ids"]
+                    if v != None and k not in ["idx", "position_ids", "latent_tokens"]
                 }
                 # https://github.com/huggingface/transformers/issues/32492
 
@@ -588,7 +588,7 @@ def main():
                 )
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=False)
-                answer_output = text_output.split("#")[-1].replace(",", "").strip()
+                answer_output = text_output.split("#")[-1].replace(",", "").replace("<|endoftext|>", "").strip()
                 cot_output = (
                     ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
                 )
