@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-a100-training
+  namespace: wcsng-log # REPLACE with your assigned NRP namespace
+spec:
+  backoffLimit: 0 # If the script crashes, don't auto-restart. Useful for debugging.
+  template:
+    spec:
+      restartPolicy: Never # CRITICAL: Ensures the pod stops when your script completes.
+      containers:
+      - name: train-test
+        # See "Gotcha #1" below regarding Python 3.12 and CUDA
+        image: python:3.12-slim 
+        
+        # This is where your pod executes its work. Once this command finishes, the pod dies.
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            echo "Starting LLM Training..."
+            pip install -r /workspace/requirements.txt
+            python /workspace/train.py
+            echo "Training complete! Exiting to release GPU."
+
+        workingDir: /workspace
+        resources:
+          limits:
+            nvidia.com/gpu: "1" # Request exactly 1 GPU
+            cpu: "8"            # NRP requires you to be reasonable with CPU/RAM vs GPU
+            memory: "64Gi"
+          requests:
+            cpu: "4"
+            memory: "32Gi"
+        volumeMounts:
+        - name: storage-volume
+          mountPath: /workspace # Mounts your persistent storage here
+          
+      # Node Affinity to explicitly request A100 GPUs
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-SXM4-40GB
+                
+      volumes:
+      - name: storage-volume
+        persistentVolumeClaim:
+          claimName: your-pvc-name # REPLACE with the name of your CephFS/Rook PVC

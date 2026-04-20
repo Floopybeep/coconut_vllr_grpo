@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: helper-test
+  namespace: wcsng-log
+spec:
+  containers:
+  - name: helper-test
+    image: ubuntu:22.04
+    command: [ "sleep", "infinity" ] # Keeps the pod alive so you can connect
+    resources:
+      requests:
+        cpu: "500m"      # Half a core
+        memory: "2Gi"    # 2 Gigabytes
+      limits:
+        cpu: "1000m"     # 1 full core (or higher)
+        memory: "4Gi"    # 4 Gigabytes (recommended for VS Code)
+    volumeMounts:
+    - name: storage-volume
+      mountPath: /workspace
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: test-pvc

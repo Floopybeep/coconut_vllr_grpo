@@ -4,4 +4,5 @@ __pycache__/**
 checkpoints/**
 temp/**
 wandb/**
-data/**
+data/openmath2_augmented_gsm8k.json
+data/openmath2_augmented_math.json
