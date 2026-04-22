@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-run
+  namespace: wcsng-log
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      
+      # Restricts placement to RTX 3090 nodes
+      nodeSelector:
+        # nvidia.com/gpu.product: NVIDIA-RTX-A6000            # 48GB, but not really available
+        nvidia.com/gpu.product: NVIDIA-GeForce-RTX-3090                 # 48GB
+      
+      # # Flexible GPU scheduling using nodeAffinity
+      # affinity:
+      #   nodeAffinity:
+      #     requiredDuringSchedulingIgnoredDuringExecution:
+      #       nodeSelectorTerms:
+      #       - matchExpressions:
+      #         - key: nvidia.com/gpu.product
+      #           operator: In
+      #           values:
+      #           - NVIDIA-L40S
+      #           - NVIDIA-RTX-A6000
+      #           - NVIDIA-A40
+        
+      containers:
+      - name: train-run
+        image: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime 
+          
+        command: 
+        - "/bin/bash"
+        - "-c"
+        - |
+          # Keep your debug logging! It's great for catching other errors.
+          exec > /workspace/startup_log_${HOSTNAME}.txt 2>&1
+
+          echo "Activating virtual environment..."
+          source /workspace/.venv/bin/activate
+
+          # 1. Navigate to your working directory
+          cd /workspace/coconut_vllr_grpo
+          
+          # 2. Launch the single WandB agent for this specific pod
+          echo "Starting Training..."
+          torchrun --nnodes 1 --nproc_per_node 4 run_grpo_emahead_DDP.py args/gsm_vllr_grpo_emahead.yaml
+        
+        resources:
+          limits:
+            nvidia.com/gpu: "4"   
+            memory: "96Gi"        
+            cpu: "16"             
+          requests:
+            nvidia.com/gpu: "4"   
+            memory: "96Gi"        
+            cpu: "16"             
+            
+        volumeMounts:
+        - name: storage-volume
+          mountPath: /workspace
+          
+      volumes:
+      - name: storage-volume
+        persistentVolumeClaim:
+          claimName: train-pvc

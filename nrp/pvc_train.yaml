@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: train-pvc
+spec:
+  # Replace with rook-cephfs if you need multiple pods to read/write at once
+  storageClassName: rook-cephfs-ucsd
+  accessModes:
+    - ReadWriteMany 
+  resources:
+    requests:
+      storage: 100Gi # Request 50 Gigabytes of storage

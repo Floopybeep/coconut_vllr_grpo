@@ -1,0 +1,60 @@
+project: coconut-grpo-dropout
+save_path: checkpoints
+name: ablation-naive-dropout
+
+only_eval: False
+verify_replay_embeddings: False
+restore_policy_rng: False
+strict_replay_structure: False
+reference_model_mode: deterministic
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+no_bot_tokens: False
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+
+train_path: data/svamp_gsm_hard_train.json
+train_path_secondary: data/gsm_train.json
+dataset_mix_ratio: 0.4
+val_path: data/gsm_test.json
+
+load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229_msdonly.pt
+resume: 0
+reset_optimizer: False
+num_epochs: 1
+
+weight_decay: 0.01
+seed: 42
+dropout: 0.1
+num_latents: 6
+eval_num_latents: 6
+max_new_tokens: 128
+
+length_penalty_per_token: 0.00
+format_penalty: -0.5
+latent_step_reward: 0.05
+kl_beta: 0.02
+clip_ratio_lower_bound: 0.2
+clip_ratio_upper_bound: 0.35
+
+lr: !!float "1e-5"
+num_rollouts: 16
+train_batch_size: 8
+train_minibatch_size: 8
+rollout_chunk_size: 16
+policy_minibatch_size: 16
+eval_batch_size: 64
+
+num_steps: 2000
+warmup_steps: 200
+eval_per_steps: 100
+ref_model_renewal_steps: 100
+
+sdpa_attention: False
+grad_checkpointing: False

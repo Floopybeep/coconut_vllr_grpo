@@ -1,0 +1,105 @@
+# GRPO fine-tuning with Differential EMA Termination Head.
+#
+# The termination head uses [current; running_mean; diff] features to detect
+# reasoning convergence, replacing the linear head that could only count steps.
+#
+# torchrun --nnodes 1 --nproc_per_node 1 run_grpo_emahead.py args/gsm_vllr_grpo_emahead.yaml
+# python infer_model_emahead_n_latent.py args/gsm_vllr_grpo_emahead.yaml --batch_size 256 --n_min 3 --n_max 16
+
+project: coconut-grpo-emahead
+save_path: checkpoints
+name: gsm-coconut-grpo-emahead
+
+only_eval: False
+# only_eval: True
+
+forced_n_latent: 0
+# forced_n_latent: 16
+
+# verify_replay_embeddings: False
+verify_replay_embeddings: True
+
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+no_bot_tokens: False
+
+termination_gamma: 1.0
+
+debug: False
+bf16: True
+save_only_improve: False
+model_id: Qwen/Qwen2.5-1.5B
+
+# Primary training dataset (receives dataset_mix_ratio fraction of samples)
+# train_path: data/openmath2_augmented_math.json
+train_path: data/svamp_gsm_hard_train.json
+train_path_secondary: data/gsm_train.json
+dataset_mix_ratio: 0.4        # 0.8 = 80% train1 + 20% train2
+
+val_path: data/gsm_test.json
+# val_path: data/gsm_valid.json
+
+save_pca_figures: False
+# save_pca_figures: True
+
+
+# Point to a trained SFT / curriculum checkpoint to start GRPO from.
+# Use "None" to start from the raw pre-trained model weights.
+# load_model_path: checkpoints/gsm-coconut-baseline-latent_stage/previous_checkpoints/checkpoint_21_260222_040229_msdonly.pt        # prev model(c=3), eval at 26.9% / 19.26% on baseline/grpo
+load_model_path: checkpoints/gsm-headdataset-emahead/260403_231611_2000steps/model_trained_head.pt                                  # current base mode
+# load_model_path: checkpoints/gsm-coconut-grpo-emahead/260405_155021/ref_models/eval_best_model_1_300_0.28.pt                      # 27.52%    (curernt SOTA)
+# load_model_path: checkpoints/gsm-coconut-grpo-emahead/260404_152450_trainedhead_grpo2/ref_models/eval_best_model_1_500_0.27.pt
+# load_model_path: checkpoints/gsm-coconut-grpo-emahead/260405_025631/ref_models/eval_best_model_1_200_0.27.pt
+
+# load_model_path: checkpoints/gsm-coconut-grpo-emahead/260404_002142/ref_models/eval_best_model_1_300_0.27.pt
+
+resume: 0
+reset_optimizer: False
+num_epochs: 1
+
+batch_size_training: 4
+weight_decay: 0.01
+seed: 42
+dropout: 0.1
+max_new_tokens: 128
+
+# Rewards & Loss hyperparameter
+length_penalty_per_token: 0.00
+format_penalty: -0.5         # negative reward for format violations (CoT leak, empty answer, no latents)
+latent_step_reward: 0.05     # small positive reward per latent token (encourages longer reasoning chains)
+kl_beta: 0.02
+clip_ratio_lower_bound: 0.2
+clip_ratio_upper_bound: 0.35 # 0.28
+
+# Termination head temperature for rollout generation. (below 0.1 = greedy, 0.1 and above = sampling)
+term_temperature: 1.0
+
+# Forced-rollout exploration.
+forced_rollout_fraction: 0.25
+forced_latent_init: 6
+
+# Differential EMA Termination Head hyperparameters
+ema_decay: 0.9              # EMA decay factor for running_mean (higher = more memory of past states)
+bottleneck_ratio: 4          # hidden_size // bottleneck_ratio = intermediate dim of the head MLP
+
+# GRPO hyperparameters
+lr: !!float "1e-5"
+num_rollouts: 16
+train_batch_size: 8
+train_minibatch_size: 8
+# policy_minibatch_size controls both rollout chunk size and backward minibatch size.
+# Must equal rollout chunk (RNG constraint). Smaller = less backward VRAM, less rollout throughput.
+# Default (omit or comment out): train_minibatch_size * 8 = 64.
+# Example: 16 splits 64 rollouts into 4 backward passes instead of 1.
+policy_minibatch_size: 16
+eval_batch_size: 64
+
+num_steps: 2000
+warmup_steps: 200
+eval_per_steps: 100
+ref_model_renewal_steps: 100
+
+sdpa_attention: False
+grad_checkpointing: False
