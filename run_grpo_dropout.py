@@ -524,6 +524,8 @@ def main():
     num_latents = configs.num_latents
     eval_num_latents = getattr(configs, "eval_num_latents", num_latents)
 
+    wandb.login(key="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")
+
     if not configs.debug and not configs.only_eval and rank == 0:
         wandb_run = wandb.init(project=configs.project, name=configs.name)
         wandb_run.config.update(configs, allow_val_change=True)
