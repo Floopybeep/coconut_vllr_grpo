@@ -126,6 +126,36 @@ def extract_answer(text, eot_token):
     return text.split("#")[-1].replace(",", "").replace(eot_token, "").strip()
 
 
+def clean_console_text(text):
+    return text.replace("<|endoftext|>", "").strip()
+
+
+def print_first_batch_outputs_to_console(
+    step,
+    tokenizer,
+    repeated_input_ids,
+    generated_all,
+    repeated_answers,
+    all_rewards,
+    prompt_len,
+    num_rollouts,
+):
+    question_text = clean_console_text(tokenizer.decode(repeated_input_ids[0].detach().cpu()))
+    print(f"\n[train sample] step {step + 1}", flush=True)
+    print(f"Question: {question_text}", flush=True)
+    for rollout_idx in range(min(num_rollouts, generated_all.shape[0])):
+        decoded_generated = tokenizer.decode(
+            generated_all[rollout_idx, prompt_len:].detach().cpu()
+        )
+        cleaned_generated = clean_console_text(decoded_generated)
+        predicted_answer = extract_answer(decoded_generated, tokenizer.eos_token)
+        print(f"Rollout {rollout_idx + 1}: {cleaned_generated}", flush=True)
+        print(f"Predicted answer: '{predicted_answer}'", flush=True)
+        print(f"Ground Truth: {repeated_answers[rollout_idx]}", flush=True)
+        print(f"Reward: {all_rewards[rollout_idx]:.2f}", flush=True)
+    print("", flush=True)
+
+
 def compute_reward(
     generated_ids,
     tokenizer,
@@ -530,6 +560,7 @@ def main():
     restore_policy_rng = getattr(configs, "restore_policy_rng", True)
     verify_replay_embeddings = getattr(configs, "verify_replay_embeddings", True)
     strict_replay_structure = getattr(configs, "strict_replay_structure", True)
+    print_first_batch_outputs = getattr(configs, "print_first_batch_outputs", False)
 
     for epoch in range(configs.resume, configs.num_epochs):
         if "train_dataloader" in locals():
@@ -772,6 +803,18 @@ def main():
                             f.write(f"Reward: {all_rewards[idx_ans]:.2f}\n\n")
                         f.write("\n\n")
                     f.write("\n" * 5 + "-" * 100 + "\n" * 5)
+
+                if wandb_run and rank == 0 and print_first_batch_outputs:
+                    print_first_batch_outputs_to_console(
+                        step=step,
+                        tokenizer=tokenizer,
+                        repeated_input_ids=repeated_input_ids,
+                        generated_all=generated_all,
+                        repeated_answers=repeated_answers,
+                        all_rewards=all_rewards,
+                        prompt_len=prompt_len,
+                        num_rollouts=configs.num_rollouts,
+                    )
 
                 prompt_ids_cpu = torch.cat(all_prompt_ids, dim=0).to(device)
                 prompt_masks_cpu = torch.cat(all_prompt_masks, dim=0).to(device)
