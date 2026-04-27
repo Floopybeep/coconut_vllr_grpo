@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: train-interactive
+  namespace: wcsng-log
+spec:
+  restartPolicy: Never
+  
+  containers:
+  - name: train-interactive
+    image: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
+    command: ["sleep", "infinity"]
+    
+    resources:
+      limits:
+        nvidia.com/a100: "1"
+        memory: "32Gi"
+        cpu: "16"
+      requests:
+        nvidia.com/a100: "1"
+        memory: "32Gi"
+        cpu: "16"
+        
+    volumeMounts:
+    - name: storage-volume
+      mountPath: /workspace
+      
+  volumes:
+  - name: storage-volume
+    persistentVolumeClaim:
+      claimName: train-pvc

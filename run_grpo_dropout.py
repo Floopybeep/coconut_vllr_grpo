@@ -42,7 +42,16 @@ def measure_timer(out_str):
     cur_time = time.time()
 
     if is_print_time:
-        print(f"[{cur_time - global_time:.2f}s] {out_str}")
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            max_alloc = torch.cuda.max_memory_allocated() / 1024**3
+            print(
+                f"[{cur_time - global_time:.2f}s] {out_str} "
+                f"(alloc={alloc:.2f}GB, reserved={reserved:.2f}GB, max_alloc={max_alloc:.2f}GB)"
+            )
+        else:
+            print(f"[{cur_time - global_time:.2f}s] {out_str}")
     global_time = cur_time
 
 
@@ -299,6 +308,87 @@ def save_model(parallel_model, save_path):
     }
     torch.save({"model_state_dict": state_dict}, save_path)
     print(f"Saved model checkpoint at {save_path}!")
+
+
+def run_validation(
+    parallel_model,
+    valid_gen_dataloader,
+    tokenizer,
+    configs,
+    latent_id,
+    eval_num_latents,
+    max_new_tokens,
+    device,
+    eval_savepath,
+    question_val,
+    rank,
+    desc="Test Accuracy",
+):
+    pbar = tqdm(
+        colour="blue",
+        desc=desc,
+        total=len(valid_gen_dataloader),
+        dynamic_ncols=True,
+    )
+    correct = torch.tensor(0, device=device)
+    total = torch.tensor(0, device=device)
+
+    was_training = parallel_model.module.training
+    parallel_model.module.eval()
+    with torch.no_grad():
+        for _, batch in enumerate(valid_gen_dataloader):
+            answers = batch["answer"]
+            idxs = batch["idx"]
+            eval_input_ids = batch["input_ids"].to(device)
+            eval_attention_mask = batch["attention_mask"].to(device)
+
+            outputs = parallel_model.module.generate_batched(
+                eval_input_ids,
+                attention_mask=eval_attention_mask,
+                num_latents=eval_num_latents,
+                max_new_tokens=max_new_tokens,
+                output_embedding=False,
+                synced_gpus=not configs.only_eval,
+            )
+
+            _, _, _, extracted, accuracies, _, _ = compute_reward(
+                outputs,
+                tokenizer,
+                answers,
+                latent_id,
+                length_penalty=configs.length_penalty_per_token,
+                format_penalty=getattr(configs, "format_penalty", -0.5),
+                latent_step_reward=getattr(configs, "latent_step_reward", 0.0),
+                coconut_mode=configs.coconut,
+            )
+
+            correct += int(sum(accuracies))
+            total += len(accuracies)
+            pbar.update(1)
+            pbar.set_description(
+                f"{desc}: {float(correct.detach().float() / total.detach().float()):.2f}"
+            )
+
+            if rank == 0:
+                with open(eval_savepath, "a+") as fp:
+                    for row_idx, pred in enumerate(extracted):
+                        question = question_val[idxs[row_idx].cpu().item()]
+                        fp.write(f"\nQuestion {idxs[row_idx].cpu().item() + 1}:\n")
+                        fp.write(f"Question = {question}\n")
+                        fp.write(f"Full output:\n{tokenizer.decode(outputs[row_idx])}\n")
+                        fp.write(f"Extracted Output:\n{pred}\n")
+                        fp.write(f"Answer = {answers[row_idx]}\n")
+                        fp.write("-" * 30 + "\n")
+
+    pbar.close()
+
+    dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total, op=dist.ReduceOp.SUM)
+
+    if was_training:
+        parallel_model.module.train()
+
+    return correct.item(), total.item()
 
 
 def compute_group_advantages(rewards, num_rollouts):
@@ -1002,6 +1092,45 @@ def main():
                 del wandb_step_payload
                 gc.collect()
                 torch.cuda.empty_cache()
+                measure_timer("Step cleanup")
+                torch.cuda.reset_peak_memory_stats()
+
+                if (step + 1) % configs.eval_per_steps == 0:
+                    eval_savepath_step = os.path.join(
+                        save_dir,
+                        f"checkpoint_{epoch + 1}_step_{step + 1}_evaluation_{current_time}.txt",
+                    )
+                    correct_step, total_step = run_validation(
+                        parallel_model,
+                        valid_gen_dataloader,
+                        tokenizer,
+                        configs,
+                        latent_id,
+                        eval_num_latents,
+                        max_new_tokens,
+                        device,
+                        eval_savepath_step,
+                        question_val,
+                        rank,
+                        desc=f"Eval @ step {step + 1}",
+                    )
+                    if rank == 0:
+                        eval_acc = correct_step / max(total_step, 1)
+                        print(
+                            f"[Step {step + 1}] Validation accuracy: "
+                            f"{correct_step} / {total_step} = {eval_acc:.4f}"
+                        )
+                        if wandb_run:
+                            wandb_run.log(
+                                {
+                                    "eval/acc": eval_acc,
+                                    "eval/correct": correct_step,
+                                    "eval/total": total_step,
+                                },
+                                step=global_step,
+                            )
+                    measure_timer("Periodic eval")
+                    torch.cuda.reset_peak_memory_stats()
 
             pbar.close()
 
@@ -1011,74 +1140,32 @@ def main():
                     save_model(parallel_model, ckpt_path)
                 dist.barrier()
 
-        pbar = tqdm(
-            colour="blue",
-            desc="Test Accuracy",
-            total=len(valid_gen_dataloader),
-            dynamic_ncols=True,
+        eval_savepath = os.path.join(
+            save_dir,
+            f"checkpoint_{epoch + 1}_evaluation_{current_time}.txt",
         )
-        correct = torch.tensor(0, device=device)
-        total = torch.tensor(0, device=device)
-
-        with torch.no_grad():
-            parallel_model.module.eval()
-            eval_savepath = os.path.join(
-                save_dir,
-                f"checkpoint_{epoch + 1}_evaluation_{current_time}.txt",
-            )
-            for _, batch in enumerate(valid_gen_dataloader):
-                answers = batch["answer"]
-                idxs = batch["idx"]
-                eval_input_ids = batch["input_ids"].to(device)
-                eval_attention_mask = batch["attention_mask"].to(device)
-
-                outputs = parallel_model.module.generate_batched(
-                    eval_input_ids,
-                    attention_mask=eval_attention_mask,
-                    num_latents=eval_num_latents,
-                    max_new_tokens=max_new_tokens,
-                    output_embedding=False,
-                    synced_gpus=not configs.only_eval,
-                )
-
-                _, _, _, extracted, accuracies, _, _ = compute_reward(
-                    outputs,
-                    tokenizer,
-                    answers,
-                    latent_id,
-                    length_penalty=configs.length_penalty_per_token,
-                    format_penalty=getattr(configs, "format_penalty", -0.5),
-                    latent_step_reward=getattr(configs, "latent_step_reward", 0.0),
-                    coconut_mode=configs.coconut,
-                )
-
-                correct += int(sum(accuracies))
-                total += len(accuracies)
-                pbar.update(1)
-                pbar.set_description(
-                    f"Test accuracy: {float(correct.detach().float() / total.detach().float()):.2f}"
-                )
-
-                if rank == 0:
-                    with open(eval_savepath, "a+") as fp:
-                        for row_idx, pred in enumerate(extracted):
-                            question = question_val[idxs[row_idx].cpu().item()]
-                            fp.write(f"\nQuestion {idxs[row_idx].cpu().item() + 1}:\n")
-                            fp.write(f"Question = {question}\n")
-                            fp.write(f"Full output:\n{tokenizer.decode(outputs[row_idx])}\n")
-                            fp.write(f"Extracted Output:\n{pred}\n")
-                            fp.write(f"Answer = {answers[row_idx]}\n")
-                            fp.write("-" * 30 + "\n")
-
-        pbar.close()
-
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        correct_end, total_end = run_validation(
+            parallel_model,
+            valid_gen_dataloader,
+            tokenizer,
+            configs,
+            latent_id,
+            eval_num_latents,
+            max_new_tokens,
+            device,
+            eval_savepath,
+            question_val,
+            rank,
+            desc="Test Accuracy",
+        )
 
         if rank == 0:
-            print(f"Accuracy on validation set: {correct.item()} / {total.item()} = {correct.item() / total.item()}")
+            eval_acc_end = correct_end / max(total_end, 1)
+            print(
+                f"Accuracy on validation set: {correct_end} / {total_end} = {eval_acc_end}"
+            )
             if wandb_run:
-                wandb_run.log({"eval/acc": correct.item() / total.item()})
+                wandb_run.log({"eval/acc": eval_acc_end})
 
         if configs.only_eval:
             break

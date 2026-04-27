@@ -1,0 +1,28 @@
+2026/04/27
+- Got training pipeline working again, with memory leak patched (~9 hrs for 2000 steps locally)
+- First run
+    Data: gsm_train 80%, SVAMP + GSM hard 20%
+    Steps: 2000, with 200 warmup steps. 100 steps per ref change & eval
+    Results
+        baseline: 20.47%
+        100: 20.32%
+        200: 19.33%
+        300: 11.30%
+        400: 9.40%
+        500: 9.40%
+        600: 9.10%
+        700: 10.46%
+        800: 11.68%
+        900: 12.28%
+        1000: 12.28%
+        1100: 13.95%
+        1200: 13.57%
+        1300: 13.95%
+        1400: 13.50%
+        1500: 14.03%
+        1600: 14.18%
+        1700: 14.86%
+        1800: 14.63%
+        1900: 14.78%
+        2000: 14.03%
+

@@ -7,13 +7,13 @@ project: coconut-grpo-dropout
 save_path: checkpoints
 name: gsm-coconut-grpo-dropout
 
-only_eval: False
+only_eval: True
 verify_replay_embeddings: False
 restore_policy_rng: True
 strict_replay_structure: True
 reference_model_mode: deterministic   # deterministic | dropout_matched
 ref_model_device: cuda                 # cpu | cuda
-track_timing: True
+track_timing: False
 log_first_batch_outputs_table: True
 
 coconut: True
@@ -33,7 +33,8 @@ dataset_mix_ratio: 0.2
 val_path: data/gsm_test.json
 dataset_max_len: 64
 
-load_model_path: checkpoints/checkpoint_21_260328_152119.pt
+# load_model_path: checkpoints/checkpoint_21_260328_152119.pt
+load_model_path: checkpoints/gsm-coconut-grpo-dropout/260427_045714/ref_models/checkpoint_0_1999.pt
 resume: 0
 reset_optimizer: False
 num_epochs: 1
@@ -43,12 +44,12 @@ seed: 42
 dropout: 0.1
 num_latents: 6
 eval_num_latents: 6
-max_new_tokens: 128
+max_new_tokens: 32
 
 # Rewards & loss
 length_penalty_per_token: 0.00
+latent_step_reward: 0.00
 format_penalty: -0.5
-latent_step_reward: 0.05
 kl_beta: 0.02
 clip_ratio_lower_bound: 0.2
 clip_ratio_upper_bound: 0.35
