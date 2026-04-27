@@ -380,6 +380,7 @@ class Coconut(nn.Module):
         kv_cache = outputs.past_key_values
 
         latent_count = 0
+        end_latent_emitted = num_latents == 0
         if num_latents > 0:
             next_embeds = outputs.output_embeds[:, -1, :]
             next_tokens = torch.full(
@@ -433,6 +434,15 @@ class Coconut(nn.Module):
                 )
                 next_embeds = hidden_states[:, -1, :]
                 latent_count += 1
+            elif not end_latent_emitted:
+                next_tokens = torch.full(
+                    (batch_size,),
+                    self.end_latent_id,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                next_embeds = self.embedding(next_tokens)
+                end_latent_emitted = True
             else:
                 raw_next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
                 next_tokens = torch.where(
@@ -471,4 +481,3 @@ class Coconut(nn.Module):
         if output_embedding:
             return tokens, new_inputs_embeds
         return tokens
-
