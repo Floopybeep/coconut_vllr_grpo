@@ -110,6 +110,7 @@ def test_rollout_replay_embeddings(
             input_ids=prompt_ids.to(device),
             attention_mask=attention_mask.to(device),
             replay_generated_ids=generated_ids.to(device),
+            return_replay_inputs_embeds=True,
         )
     assert_rollout_replay_embeddings_match(
         replay_outputs,
@@ -130,8 +131,7 @@ def clean_console_text(text):
     return text.replace("<|endoftext|>", "").strip()
 
 
-def print_first_batch_outputs_to_console(
-    step,
+def build_first_batch_outputs_table(
     tokenizer,
     repeated_input_ids,
     generated_all,
@@ -139,21 +139,38 @@ def print_first_batch_outputs_to_console(
     all_rewards,
     prompt_len,
     num_rollouts,
+    all_base_rewards,
 ):
-    question_text = clean_console_text(tokenizer.decode(repeated_input_ids[0].detach().cpu()))
-    print(f"\n[train sample] step {step + 1}", flush=True)
-    print(f"Question: {question_text}", flush=True)
+    question_text = clean_console_text(
+        tokenizer.decode(repeated_input_ids[0].detach().cpu())
+    )
+    table = wandb.Table(
+        columns=[
+            "rollout_index",
+            "question",
+            "generated",
+            "predicted_answer",
+            "ground_truth",
+            "reward",
+            "base_reward",
+        ]
+    )
     for rollout_idx in range(min(num_rollouts, generated_all.shape[0])):
         decoded_generated = tokenizer.decode(
             generated_all[rollout_idx, prompt_len:].detach().cpu()
         )
         cleaned_generated = clean_console_text(decoded_generated)
         predicted_answer = extract_answer(decoded_generated, tokenizer.eos_token)
-        print(f"Rollout {rollout_idx + 1}: {cleaned_generated}", flush=True)
-        print(f"Predicted answer: '{predicted_answer}'", flush=True)
-        print(f"Ground Truth: {repeated_answers[rollout_idx]}", flush=True)
-        print(f"Reward: {all_rewards[rollout_idx]:.2f}", flush=True)
-    print("", flush=True)
+        table.add_data(
+            rollout_idx + 1,
+            question_text,
+            cleaned_generated,
+            predicted_answer,
+            repeated_answers[rollout_idx],
+            float(all_rewards[rollout_idx]),
+            float(all_base_rewards[rollout_idx]),
+        )
+    return table
 
 
 def compute_reward(
@@ -350,6 +367,9 @@ def main():
 
     global is_print_time
     is_print_time = configs.track_timing
+
+    if is_print_time:
+        print("Tracking timing...")
 
     dist.barrier(device_ids=[local_rank])
 
@@ -562,7 +582,11 @@ def main():
     restore_policy_rng = getattr(configs, "restore_policy_rng", True)
     verify_replay_embeddings = getattr(configs, "verify_replay_embeddings", True)
     strict_replay_structure = getattr(configs, "strict_replay_structure", True)
-    print_first_batch_outputs = getattr(configs, "print_first_batch_outputs", False)
+    log_first_batch_outputs_table = getattr(
+        configs,
+        "log_first_batch_outputs_table",
+        getattr(configs, "print_first_batch_outputs", False),
+    )
 
     for epoch in range(configs.resume, configs.num_epochs):
         if "train_dataloader" in locals():
@@ -601,7 +625,7 @@ def main():
                 or configs.no_thoughts
                 or configs.no_bot_tokens,
                 shuffle=True,
-                max_question_len=128,
+                max_question_len=configs.dataset_max_len,
                 num_samples=configs.num_steps * configs.train_batch_size,
             )
 
@@ -700,8 +724,10 @@ def main():
 
                 measure_timer("Batch prep")
 
+                # Rollout ####################################################################################################################
+
                 parallel_model.module.train()
-                with torch.no_grad():
+                with torch.inference_mode():
                     for rollout_start in range(0, repeated_input_ids.shape[0], rollout_chunk_size):
                         rollout_end = min(
                             rollout_start + rollout_chunk_size,
@@ -757,26 +783,18 @@ def main():
 
                         all_rewards.extend(rewards)
                         all_base_rewards.extend(base_rewards)
-                        all_token_ids.append(generated)
+                        all_token_ids.append(generated.detach().cpu())
                         all_prompt_ids.append(prompt_chunk.detach().cpu())
                         all_prompt_masks.append(attn_chunk.detach().cpu())
                         all_rollout_rng_states.append(rng_state)
                         all_correct += sum(accuracies)
                         all_total += len(accuracies)
+                        del generated
 
                 measure_timer("Rollout generation")
 
                 avg_reward = sum(all_rewards) / max(len(all_rewards), 1)
-                if wandb_run and rank == 0:
-                    wandb_run.log(
-                        {
-                            "train/batch_avg_reward": avg_reward,
-                            "train/batch_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
-                            "train/batch_accuracy": all_correct / max(all_total, 1),
-                            "train/batch_n_latent_avg": num_latents,
-                            "train/batch_n_latent_correct_avg": n_latents_correct_sum / n_latents_correct_num if n_latents_correct_num > 0 else 0,
-                        }
-                    )
+                global_step = epoch * total_length + step + 1
 
                 max_len = max(token_ids.shape[1] for token_ids in all_token_ids)
                 padded_token_ids = []
@@ -788,9 +806,9 @@ def main():
                         padded = token_ids
                     padded_token_ids.append(padded)
 
+                generated_all = torch.cat(padded_token_ids, dim=0)
                 with open(log_path, "a") as f:
                     f.write(f"Step {step}, Average Reward: {avg_reward:.3f}\n")
-                    generated_all = torch.cat(padded_token_ids, dim=0)
                     for i in range(batch_len):
                         for j in range(configs.num_rollouts):
                             idx_ans = i * configs.num_rollouts + j
@@ -805,24 +823,39 @@ def main():
                             f.write(f"Reward: {all_rewards[idx_ans]:.2f}\n\n")
                         f.write("\n\n")
                     f.write("\n" * 5 + "-" * 100 + "\n" * 5)
+                wandb_step_payload = None
+                if wandb_run and rank == 0:
+                    wandb_step_payload = {
+                        "train/epoch": epoch + 1,
+                        "train/step": step + 1,
+                        "train/global_step": global_step,
+                        "train/batch_avg_reward": avg_reward,
+                        "train/batch_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
+                        "train/batch_accuracy": all_correct / max(all_total, 1),
+                        "train/batch_n_latent_avg": num_latents,
+                        "train/batch_n_latent_correct_avg": n_latents_correct_sum / n_latents_correct_num if n_latents_correct_num > 0 else 0,
+                    }
+                    if log_first_batch_outputs_table:
+                        wandb_step_payload["train/first_batch_outputs"] = build_first_batch_outputs_table(
+                            tokenizer=tokenizer,
+                            repeated_input_ids=repeated_input_ids,
+                            generated_all=generated_all,
+                            repeated_answers=repeated_answers,
+                            all_rewards=all_rewards,
+                            prompt_len=prompt_len,
+                            num_rollouts=configs.num_rollouts,
+                            all_base_rewards=all_base_rewards,
+                        )
 
-                if wandb_run and rank == 0 and print_first_batch_outputs:
-                    print_first_batch_outputs_to_console(
-                        step=step,
-                        tokenizer=tokenizer,
-                        repeated_input_ids=repeated_input_ids,
-                        generated_all=generated_all,
-                        repeated_answers=repeated_answers,
-                        all_rewards=all_rewards,
-                        prompt_len=prompt_len,
-                        num_rollouts=configs.num_rollouts,
-                    )
+                # Advantage Calculation ##########################################################################################################
 
                 prompt_ids_cpu = torch.cat(all_prompt_ids, dim=0).to(device)
                 prompt_masks_cpu = torch.cat(all_prompt_masks, dim=0).to(device)
-                token_ids = torch.cat(padded_token_ids, dim=0).to(device)
+                token_ids = generated_all.to(device)
                 reward_tensor = torch.tensor(all_rewards, device=device, dtype=torch.float32)
                 advantages = compute_group_advantages(reward_tensor, configs.num_rollouts)
+
+                # Reference Replay ###############################################################################################################
 
                 with torch.no_grad():
                     ref_lp_chunks = []
@@ -862,7 +895,8 @@ def main():
                         )
                         ref_lp_chunks.append(ref_lp_chunk.cpu() if ref_model_device_name == "cpu" else ref_lp_chunk)
                         ref_mask_chunks.append(ref_mask_chunk.cpu() if ref_model_device_name == "cpu" else ref_mask_chunk)
-                        del ref_outputs
+                        del ref_outputs, ref_lp_chunk, ref_mask_chunk
+                        del ref_prompt, ref_mask, ref_tok
 
                     ref_lp_per_token = torch.cat(ref_lp_chunks, dim=0)
                     ref_loss_mask = torch.cat(ref_mask_chunks, dim=0)
@@ -871,6 +905,8 @@ def main():
                         ref_loss_mask = ref_loss_mask.to(device)
 
                 measure_timer("Reference replay")
+
+                # Policy Update ############################################################################################################
 
                 total_rollouts = token_ids.shape[0]
                 total_nonmasked = ref_loss_mask.sum().clamp(min=1)
@@ -907,7 +943,6 @@ def main():
                         num_latents,
                         tokenizer.eos_token_id,
                     )
-                    del mb_new_outputs
 
                     mb_log_ratio = mb_new_lp - mb_ref_lp
                     mb_log_ratio_clamped = mb_log_ratio.clamp(-5, 5)
@@ -932,6 +967,9 @@ def main():
                             max_log_ratio,
                             mb_log_ratio.detach().abs().max(),
                         )
+                    del mb_new_outputs, mb_new_lp, mb_log_ratio, mb_log_ratio_clamped
+                    del mb_ratio, mb_clipped, t1, t2, mb_policy_loss, mb_kl, mb_total_loss, mb_loss
+                    del mb_prompt, mb_mask, mb_tok, mb_adv, mb_ref_lp, mb_ref_mask
 
                 measure_timer("Policy replay")
 
@@ -939,17 +977,16 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
 
-                if wandb_run and rank == 0:
-                    wandb_run.log(
+                if wandb_step_payload is not None:
+                    wandb_step_payload.update(
                         {
-                            "train/epoch": epoch + 1,
-                            "train/step": step + 1,
                             "train/loss": step_loss,
                             "train/learning_rate": optimizer.param_groups[0]["lr"],
                             "train/max_log_ratio": max_log_ratio.item(),
                             "train/zero_reward_frac": sum(1 for r in all_rewards if r <= 0) / max(len(all_rewards), 1),
                         }
                     )
+                    wandb_run.log(wandb_step_payload, step=global_step)
 
                 pbar.update(1)
                 pbar.set_description(
@@ -957,8 +994,12 @@ def main():
                     f"step {step}/{len(train_dataloader)} (loss: {step_loss:.4f})"
                 )
 
-                del token_ids, prompt_ids_cpu, prompt_masks_cpu, reward_tensor
-                del all_token_ids, all_prompt_ids, all_prompt_masks
+                del token_ids, prompt_ids_cpu, prompt_masks_cpu, reward_tensor, advantages
+                del generated_all, padded_token_ids, ref_lp_per_token, ref_loss_mask
+                del all_token_ids, all_prompt_ids, all_prompt_masks, all_rollout_rng_states
+                del repeated_input_ids, repeated_attention_mask
+                del ref_lp_chunks, ref_mask_chunks
+                del wandb_step_payload
                 gc.collect()
                 torch.cuda.empty_cache()
 

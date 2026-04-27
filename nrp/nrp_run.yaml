@@ -9,24 +9,6 @@ spec:
     spec:
       restartPolicy: Never
       
-      # Restricts placement to RTX 3090 nodes
-      nodeSelector:
-        # nvidia.com/gpu.product: NVIDIA-RTX-A6000            # 48GB, but not really available
-        nvidia.com/gpu.product: NVIDIA-GeForce-RTX-3090                 # 48GB
-      
-      # # Flexible GPU scheduling using nodeAffinity
-      # affinity:
-      #   nodeAffinity:
-      #     requiredDuringSchedulingIgnoredDuringExecution:
-      #       nodeSelectorTerms:
-      #       - matchExpressions:
-      #         - key: nvidia.com/gpu.product
-      #           operator: In
-      #           values:
-      #           - NVIDIA-L40S
-      #           - NVIDIA-RTX-A6000
-      #           - NVIDIA-A40
-        
       containers:
       - name: train-run
         image: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime 
@@ -42,21 +24,21 @@ spec:
           source /workspace/.venv/bin/activate
 
           # 1. Navigate to your working directory
-          cd /workspace/coconut_vllr_grpo
+          cd /workspace/coconut_dropout
           
           # 2. Launch the single WandB agent for this specific pod
           echo "Starting Training..."
-          torchrun --nnodes 1 --nproc_per_node 4 run_grpo_emahead_DDP.py args/gsm_vllr_grpo_emahead.yaml
+          torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout.py args/gsm_dropout.yaml
         
         resources:
           limits:
-            nvidia.com/gpu: "4"   
-            memory: "96Gi"        
-            cpu: "16"             
+            nvidia.com/a100: "1"   # Correctly requesting the special resource
+            memory: "64Gi"        
+            cpu: "32"             
           requests:
-            nvidia.com/gpu: "4"   
-            memory: "96Gi"        
-            cpu: "16"             
+            nvidia.com/a100: "1"   # Correctly requesting the special resource
+            memory: "64Gi"        
+            cpu: "32"             
             
         volumeMounts:
         - name: storage-volume

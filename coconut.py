@@ -53,7 +53,7 @@ class Coconut(nn.Module):
             self.embedding.weight.data.copy_(model_embedding.weight.data)
             self.embedding.norm = nn.Identity()
             self.base_causallm.set_input_embeddings(self.embedding)
-            self.base_causallm.lm_head.weight = self.embedding.weight
+            # self.base_causallm.lm_head.weight = self.embedding.weight
 
     def _forward_base(
         self,
@@ -91,7 +91,14 @@ class Coconut(nn.Module):
             for k, v in kv_cache
         ]
 
-    def _replay_generate_batched(self, input_ids, attention_mask, replay_generated_ids):
+    def _replay_generate_batched(
+        self,
+        input_ids,
+        attention_mask,
+        replay_generated_ids,
+        return_inputs_embeds=False,
+        return_past_key_values=False,
+    ):
         batch_size = input_ids.shape[0]
         prompt_len = input_ids.shape[1]
         full_len = replay_generated_ids.shape[1]
@@ -127,7 +134,7 @@ class Coconut(nn.Module):
         is_terminated = is_terminated | (first_expected == self.eos_token_id)
 
         last_embed = first_next_embeds.unsqueeze(1)
-        embed_list = [prompt_outputs.inputs_embeds, last_embed]
+        embed_list = [prompt_outputs.inputs_embeds, last_embed] if return_inputs_embeds else None
         gen_mask = torch.cat(
             [
                 attention_mask,
@@ -161,7 +168,8 @@ class Coconut(nn.Module):
 
             is_terminated = is_terminated | (active & (expected_tokens == self.eos_token_id))
             last_embed = next_embeds.unsqueeze(1)
-            embed_list.append(last_embed)
+            if embed_list is not None:
+                embed_list.append(last_embed)
             gen_mask = torch.cat(
                 [
                     gen_mask,
@@ -178,10 +186,10 @@ class Coconut(nn.Module):
 
         return Outputs(
             loss=None,
-            inputs_embeds=torch.cat(embed_list, dim=1),
+            inputs_embeds=torch.cat(embed_list, dim=1) if embed_list is not None else None,
             output_embeds=None,
             logits=torch.cat(logits_list, dim=1),
-            past_key_values=kv_cache,
+            past_key_values=kv_cache if return_past_key_values else None,
         )
 
     def forward(
@@ -202,7 +210,11 @@ class Coconut(nn.Module):
         if replay_generated_ids is not None:
             assert input_ids is not None, "Prompt input_ids are required for replay"
             return self._replay_generate_batched(
-                input_ids, attention_mask, replay_generated_ids
+                input_ids,
+                attention_mask,
+                replay_generated_ids,
+                return_inputs_embeds=kwargs.get("return_replay_inputs_embeds", False),
+                return_past_key_values=kwargs.get("return_replay_past_key_values", False),
             )
 
         if reset_kv_cache:
