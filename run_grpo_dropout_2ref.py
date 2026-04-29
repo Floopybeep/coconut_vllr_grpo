@@ -1,5 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
+#
+# Proof-faithful variant of run_grpo_dropout.py.
+# Differences vs. the base script (mapped to research_draft.tex):
+#   D1: separate theta_old (ratio denominator, captured at rollout time)
+#       from pi_ref (KL anchor, frozen ref_model). Restores Theorem 4.4
+#       condition rho_{theta_old} == 1 at update start.
+#   D2: default reference_model_mode = "dropout_matched". Restores CRN
+#       coupling between rollout and reference forward (Prop 4.5).
+#   D3: KL is computed against pi_ref via a separate log-ratio variable,
+#       so KL on the augmented policy is well-defined regardless of
+#       theta_old drift.
 
 import os
 import sys
@@ -440,7 +451,9 @@ def main():
     set_seed(configs.seed)
     configs.__dict__["start_time"] = current_time
     save_dir = os.path.join(configs.save_path, configs.name, current_time)
-    reference_model_mode = getattr(configs, "reference_model_mode", "deterministic")
+    # D2: default to "dropout_matched" so KL anchor is evaluated under the
+    # same dropout mask as rollout (CRN coupling assumed in Prop 4.5).
+    reference_model_mode = getattr(configs, "reference_model_mode", "dropout_matched")
     ref_model_device_name = getattr(configs, "ref_model_device", "cuda").lower()
 
     if ref_model_device_name not in {"cuda", "cpu"}:
@@ -952,6 +965,47 @@ def main():
                 reward_tensor = torch.tensor(all_rewards, device=device, dtype=torch.float32)
                 advantages = compute_group_advantages(reward_tensor, configs.num_rollouts)
 
+                # Theta_old Replay ###############################################################################################################
+                # D1: replay generated tokens through current parallel_model
+                # (still at theta_old: no optimizer.step yet) under matched
+                # dropout RNG. Yields log p_{theta_old}(y | x, xi) for the
+                # PPO ratio denominator. Chunk granularity must equal the
+                # rollout granularity so rng_state index aligns.
+
+                with torch.no_grad():
+                    theta_old_lp_chunks = []
+                    theta_old_mask_chunks = []
+                    was_training = parallel_model.module.training
+                    parallel_model.module.train()
+                    for mb_start in range(0, token_ids.shape[0], rollout_chunk_size):
+                        mb_end = min(mb_start + rollout_chunk_size, token_ids.shape[0])
+                        restore_rng_state(
+                            all_rollout_rng_states[mb_start // rollout_chunk_size],
+                            device,
+                        )
+                        old_outputs = parallel_model.module(
+                            input_ids=prompt_ids_cpu[mb_start:mb_end],
+                            attention_mask=prompt_masks_cpu[mb_start:mb_end],
+                            replay_generated_ids=token_ids[mb_start:mb_end],
+                        )
+                        old_lp_chunk, old_mask_chunk = compute_log_probs(
+                            token_ids[mb_start:mb_end],
+                            old_outputs,
+                            prompt_len,
+                            num_latents,
+                            tokenizer.eos_token_id,
+                        )
+                        theta_old_lp_chunks.append(old_lp_chunk.detach())
+                        theta_old_mask_chunks.append(old_mask_chunk.detach())
+                        del old_outputs, old_lp_chunk, old_mask_chunk
+
+                    theta_old_lp = torch.cat(theta_old_lp_chunks, dim=0)
+                    theta_old_loss_mask = torch.cat(theta_old_mask_chunks, dim=0)
+                    if not was_training:
+                        parallel_model.module.eval()
+
+                measure_timer("Theta_old replay")
+
                 # Reference Replay ###############################################################################################################
 
                 with torch.no_grad():
@@ -1008,6 +1062,7 @@ def main():
                 total_rollouts = token_ids.shape[0]
                 total_nonmasked = ref_loss_mask.sum().clamp(min=1)
                 max_log_ratio = torch.tensor(0.0, device=device)
+                max_log_ratio_ref = torch.tensor(0.0, device=device)
                 step_loss = 0.0
 
                 optimizer.zero_grad()
@@ -1025,6 +1080,9 @@ def main():
                     mb_mask = prompt_masks_cpu[mb_start:mb_end]
                     mb_tok = token_ids[mb_start:mb_end]
                     mb_adv = advantages[mb_start:mb_end]
+                    # D1: theta_old log-prob = ratio denominator.
+                    mb_old_lp = theta_old_lp[mb_start:mb_end]
+                    # D3: ref log-prob used only for the KL anchor.
                     mb_ref_lp = ref_lp_per_token[mb_start:mb_end]
                     mb_ref_mask = ref_loss_mask[mb_start:mb_end]
 
@@ -1041,7 +1099,8 @@ def main():
                         tokenizer.eos_token_id,
                     )
 
-                    mb_log_ratio = mb_new_lp - mb_ref_lp
+                    # PPO clip on rho = pi_theta / pi_{theta_old} (eq 4.6).
+                    mb_log_ratio = mb_new_lp - mb_old_lp
                     mb_log_ratio_clamped = mb_log_ratio.clamp(-5, 5)
                     mb_ratio = torch.exp(mb_log_ratio_clamped)
                     mb_clipped = torch.clamp(
@@ -1053,7 +1112,13 @@ def main():
                     t1 = mb_ratio * mb_adv.unsqueeze(-1)
                     t2 = mb_clipped * mb_adv.unsqueeze(-1)
                     mb_policy_loss = -torch.min(t1, t2)
-                    mb_kl = mb_ratio - mb_log_ratio_clamped - 1.0
+
+                    # k3 KL estimator against pi_ref (eq 4.7 KL term).
+                    mb_log_ratio_ref = mb_new_lp - mb_ref_lp
+                    mb_log_ratio_ref_clamped = mb_log_ratio_ref.clamp(-5, 5)
+                    mb_ratio_ref = torch.exp(mb_log_ratio_ref_clamped)
+                    mb_kl = mb_ratio_ref - mb_log_ratio_ref_clamped - 1.0
+
                     mb_total_loss = mb_policy_loss + configs.kl_beta * mb_kl
                     mb_loss = (mb_total_loss * mb_ref_mask).sum() / total_nonmasked
 
@@ -1064,9 +1129,15 @@ def main():
                             max_log_ratio,
                             mb_log_ratio.detach().abs().max(),
                         )
+                        max_log_ratio_ref = torch.max(
+                            max_log_ratio_ref,
+                            mb_log_ratio_ref.detach().abs().max(),
+                        )
                     del mb_new_outputs, mb_new_lp, mb_log_ratio, mb_log_ratio_clamped
-                    del mb_ratio, mb_clipped, t1, t2, mb_policy_loss, mb_kl, mb_total_loss, mb_loss
-                    del mb_prompt, mb_mask, mb_tok, mb_adv, mb_ref_lp, mb_ref_mask
+                    del mb_ratio, mb_clipped, t1, t2, mb_policy_loss
+                    del mb_log_ratio_ref, mb_log_ratio_ref_clamped, mb_ratio_ref, mb_kl
+                    del mb_total_loss, mb_loss
+                    del mb_prompt, mb_mask, mb_tok, mb_adv, mb_old_lp, mb_ref_lp, mb_ref_mask
 
                 measure_timer("Policy replay")
 
@@ -1080,6 +1151,7 @@ def main():
                             "train/loss": step_loss,
                             "train/learning_rate": optimizer.param_groups[0]["lr"],
                             "train/max_log_ratio": max_log_ratio.item(),
+                            "train/max_log_ratio_ref": max_log_ratio_ref.item(),
                             "train/zero_reward_frac": sum(1 for r in all_rewards if r <= 0) / max(len(all_rewards), 1),
                         }
                     )
@@ -1093,6 +1165,8 @@ def main():
 
                 del token_ids, prompt_ids_cpu, prompt_masks_cpu, reward_tensor, advantages
                 del generated_all, padded_token_ids, ref_lp_per_token, ref_loss_mask
+                del theta_old_lp, theta_old_loss_mask
+                del theta_old_lp_chunks, theta_old_mask_chunks
                 del all_token_ids, all_prompt_ids, all_prompt_masks, all_rollout_rng_states
                 del repeated_input_ids, repeated_attention_mask
                 del ref_lp_chunks, ref_mask_chunks
