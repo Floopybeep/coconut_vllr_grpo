@@ -1,4 +1,5 @@
 2026/04/27
+- BASELINE: 27.45% (torchrun --nnodes 1 --nproc_per_node 1 run.py args/gsm_coconut.yaml)
 - Got training pipeline working again, with memory leak patched (~9 hrs for 2000 steps locally)
 - First run
     Data: gsm_train 80%, SVAMP + GSM hard 20%
@@ -29,3 +30,25 @@
     Analysis
         Shows collapse in the first ~400 steps. May hav
 
+2026/04/28
+- Found that my assumption of dropout mask staying consistent across a single latent chain was wrong, a new mask was generated for every time step
+    - This kind of dropout masking is called "Variational Dropout"
+- Implemented and working in run_grpo_dropout_variational.py
+
+2026/04/30
+- Barely got it to work above 28% accuracy... (could be pure chance, who knows?)
+
+2026/05/02
+- Added per-prompt screening (DAPO-style) in order to drop batches with 0% accuracy
+- Removed group advantage normalization (Dr. GRPO - style)
+
+- Curretnly training no group adv norm, should also try training multiple epochs with 1k total steps
+
+2026/05/03
+- WE ARE SO BACK!!!!!
+    - removing group adv normalization did the trick!
+    - 28.73% accuracy
+- Currently trying reference renewal every 500 epochs, and lowered the clip upper bound 
+    - 29.42% let's goooo!!!!
+
+- Will try running on different seeds next

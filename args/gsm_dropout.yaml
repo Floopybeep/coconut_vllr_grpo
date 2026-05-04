@@ -2,18 +2,20 @@
 #
 # Main command:
 #   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout.py args/gsm_dropout.yaml
+#   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_2ref.py args/gsm_dropout.yaml
+#   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_variational.py args/gsm_dropout.yaml
 
 project: coconut-grpo-dropout
 save_path: checkpoints
 name: gsm-coconut-grpo-dropout
 
-verify_replay_embeddings: False
+verify_replay_embeddings: True
 restore_policy_rng: True
 strict_replay_structure: True
-reference_model_mode: deterministic   # deterministic | dropout_matched
+reference_model_mode: dropout_matched   # deterministic | dropout_matched
 ref_model_device: cuda                 # cpu | cuda
 track_timing: False
-log_first_batch_outputs_table: True
+log_first_batch_outputs_table: False
 
 coconut: True
 cot: False
@@ -24,53 +26,64 @@ no_bot_tokens: False
 debug: False
 bf16: True
 only_eval: False
-save_only_improve: False
+save_only_improve: True
+mandatory_save_per_epochs: 1000
 model_id: Qwen/Qwen2.5-1.5B
 
 train_path: data/svamp_gsm_hard_train.json
 # train_path_secondary: data/gsm_train.json
 train_path_secondary: data/openmath2_augmented_gsm8k.json
-dataset_mix_ratio: 0.1
+dataset_mix_ratio: 0.2
 val_path: data/gsm_test.json
-dataset_max_len: 64
+dataset_max_len: 96
 
 # load_model_path: checkpoints/checkpoint_21_260328_152119.pt         # c=2 ckpt, 20-ish%
 load_model_path: checkpoints/checkpoint_21_260222_040229_msdonly.pt     # c=3 ckpt, 27.4%
 # load_model_path: checkpoints/gsm-coconut-grpo-dropout/260427_045714/ref_models/checkpoint_0_1999.pt
 resume: 0
-reset_optimizer: False
+reset_optimizer: True
 num_epochs: 1
 
 weight_decay: 0.01
-seed: 123
-dropout: 0.3
+seed: 124
+dropout: 0.1
 num_latents: 6
 eval_num_latents: 6
 max_new_tokens: 32
+
+# Rollout results filtering - remove prompts if they are too easy/hard                                                                                                
+enable_group_filter: true                                                                                                                                                                                        
+filter_min_accuracy: 0.20                                                                                                                                                                                        
+filter_max_accuracy: 0.98                        
+
+advantage_clip: 20.0     # clip advantage, because it may blow up for near-identical answer groups ((adv - mean) / std) - DROPPED (citing Dr. GRPO)
 
 # Rewards & loss
 length_penalty_per_token: 0
 latent_step_reward: 0
 format_penalty: -0.5
+eps: !!float "1e-4"       # formerly 1e-8
 
 skip_kl: False
-kl_beta: 0.1    # sharp increase from 0.02 to increase early-run stability
+kl_beta: 0.005    # sharp increase from 0.02 to increase early-run stability
 clip_ratio_lower_bound: 0.1
-clip_ratio_upper_bound: 0.15
+clip_ratio_upper_bound: 0.12
+grad_clip_norm: 10.0
 
 # GRPO
 lr: !!float "1e-5"
-num_rollouts: 16
-train_batch_size: 8
-train_minibatch_size: 8
-rollout_chunk_size: 8
-policy_minibatch_size: 8
-eval_batch_size: 32
+num_rollouts: 32
+train_batch_size: 16
+train_minibatch_size: 16
+rollout_chunk_size: 32
+policy_minibatch_size: 32
+eval_batch_size: 1
 
-num_steps: 10000
-warmup_steps: 800
+num_steps: 3000
+warmup_steps: 200
 eval_per_steps: 100
-ref_model_renewal_steps: 100     # sharp reduction from previous 100
+ref_model_renewal_steps: 500     # sharp reduction from previous 100
+enable_faster_warmup_renewal: false
 
 sdpa_attention: False
 grad_checkpointing: False

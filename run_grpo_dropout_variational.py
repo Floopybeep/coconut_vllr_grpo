@@ -10,18 +10,78 @@
 #       interpretation of dropout (Gal & Ghahramani 2016) holds end to
 #       end. Updated draft eq 2.3:
 #           xi ~ p(xi),  tilde_theta_t(xi) == tilde_theta(xi) for all t.
-#   V2: configure_variational_dropout zeros attention dropout explicitly.
-#       Attention-prob mask shape grows with kv-cache length, so the
-#       RNG-restore trick used by CoconutVariational does not produce
-#       a coherent variational pattern there. Setting it to 0 keeps the
-#       Bayesian story exact for residual / MLP / embedding dropouts,
-#       which are the main sources of regularization in modern decoders
-#       (LLaMA, Mistral, Qwen all ship attention_dropout = 0 already).
+#   V2 (revised): configure_variational_dropout sets ALL dropout config
+#       attrs to the requested rate, including attention_dropout. The
+#       original plan zeroed attention_dropout for a clean Bayesian story,
+#       but Qwen2 / LLaMA / Mistral / Gemma have no other dropout layers
+#       in their architecture, so zeroing it left the model deterministic
+#       and rollouts collapsed to identical generations. With attention
+#       dropout active, the variational interpretation is approximate on
+#       these models (attention mask shape varies with kv-cache length so
+#       per-step masks differ within a chain), but the proof framework
+#       (D1 / D2 / D3, Theorem 4.4, Prop 4.5) is unaffected --- those only
+#       require xi to be theta-independent and replayable, which holds.
+#       For GPT-2-family models that ship with embd_pdrop / resid_pdrop,
+#       the residual and MLP dropouts still get a true locked mask across
+#       t via CoconutVariational's RNG restore, recovering the clean
+#       Bayesian story for those layers.
 #   V3: ref_model_renewal_steps = 0 in the YAML -> pi_ref is frozen at
 #       SFT init for the entire run. Matches Theorem 4.4 corollary's
 #       requirement that the KL anchor be a fixed reference distribution.
 #       Strongly recommended; refresh > 0 is left as an option for staged
 #       training but is not proof-faithful.
+#   V4: Huberized k3 KL. The prior log_ratio.clamp(-5, 5) zeroed the
+#       gradient outside the bound, so any token with |log_ratio_ref| > 5
+#       escaped KL regularization entirely (a pre-collapse signature on
+#       long runs). The new estimator keeps k3 inside |r| <= delta and
+#       extends linearly outside, value- and slope-matched at the
+#       boundary, so KL stays C^1 with bounded but nonzero tail gradient.
+#   V5: kl_beta annealed alongside lr -- current_kl_beta =
+#       configs.kl_beta * (lr_now / lr_peak). Without this, lr cosine-
+#       annealing leaves a constant KL pull on a shrinking step, dragging
+#       theta back toward the frozen ref. With it, the trust region
+#       shrinks proportionally and each step retains the same fractional
+#       KL pull.
+#   V6: Sequence-mean loss aggregation (per draft Algorithm 1, standard
+#       GRPO). Per-token loss is averaged within each rollout, then
+#       averaged across rollouts. Replaces the prior token-mean
+#       (sum / total_tokens) which underweighted short responses and
+#       entangled per-sequence weight with sequence length.
+#   V8: Dr.GRPO advantage (Liu et al. 2024). compute_group_advantages
+#       drops the sigma_r normalization: A^(k) = r^(k) - mu_r instead
+#       of (r^(k) - mu_r) / (sigma_r + eps). The std-divided form is
+#       a biased estimator of the policy gradient because sigma_r is
+#       a nonlinear function of every r^(j) including r^(k), so the
+#       control-variate identity that zeros out a baseline in
+#       expectation does NOT extend to dividing by it. The bias
+#       reweights prompts by inverse difficulty variance and was the
+#       gap in the previous Theorem 4.4 proof. With the fix, the
+#       gradient is unbiased up to a constant (1 - 1/K) scale that
+#       folds into the learning rate. See revised draft Theorem 4.4
+#       in research_draft_revised.tex.
+#   V7: Group-level filter on rollout accuracy. After rollouts, drop
+#       whole groups whose accuracy is outside
+#       [filter_min_accuracy, filter_max_accuracy] (defaults 0.05, 0.95)
+#       BEFORE theta_old replay / ref replay / policy update. Saves
+#       ~25% of step time on filtered groups and concentrates the
+#       gradient on "marginal" prompts where the reward signal is
+#       strongest. Acts as an online curriculum -- as the policy
+#       improves, easy groups drop out automatically.
+#       Constraint: rollout_chunk_size MUST equal num_rollouts so each
+#       chunk is one group; this preserves the chunk-aligned
+#       RNG-restore replay structure. Validated at step start; raises
+#       a clear ValueError if violated. Toggle via enable_group_filter
+#       (default False so existing YAMLs are unaffected).
+#       Skip behavior: an all_reduce on the per-rank kept count makes
+#       a global skip decision. If NO rank has kept groups, every rank
+#       skips the policy update entirely (no optimizer.step, no
+#       lr_scheduler.step) -- the prior fallback of forcing zero-var
+#       groups through produced a pure-KL gradient toward ref, which
+#       is exactly the dynamic the filter is meant to prevent. If at
+#       least one rank has kept groups, locally-empty ranks fall back
+#       to using all their chunks so DDP backward stays in lockstep;
+#       the resulting pure-KL gradient on those ranks is diluted by
+#       1/world_size in the gradient average.
 #
 # All D1/D2/D3 properties from research_draft.tex are preserved.
 
@@ -35,6 +95,7 @@ import copy
 import datetime
 import gc
 import json
+import math
 import time
 
 import bitsandbytes as bnb
@@ -297,13 +358,23 @@ def build_response_mask(token_ids, response_start, eos_id):
     return positions < first_eos.unsqueeze(1)
 
 
-def compute_log_probs(token_ids, model_outputs, prompt_len, num_latents, eos_id):
+def compute_log_probs(
+    token_ids,
+    model_outputs,
+    prompt_len,
+    num_latents,
+    eos_id,
+    return_entropy=False,
+):
     response_start = prompt_len + num_latents
     if token_ids.shape[1] <= response_start:
-        return (
-            torch.zeros(token_ids.shape[0], 0, device=token_ids.device),
-            torch.zeros(token_ids.shape[0], 0, dtype=torch.bool, device=token_ids.device),
+        zero_lp = torch.zeros(token_ids.shape[0], 0, device=token_ids.device)
+        zero_mask = torch.zeros(
+            token_ids.shape[0], 0, dtype=torch.bool, device=token_ids.device
         )
+        if return_entropy:
+            return zero_lp, zero_mask, zero_lp.clone()
+        return zero_lp, zero_mask
 
     response_tokens = token_ids[:, response_start:]
     gen_len = response_tokens.shape[1]
@@ -322,6 +393,12 @@ def compute_log_probs(token_ids, model_outputs, prompt_len, num_latents, eos_id)
     lm_log_p_gen = F.log_softmax(lm_logits_gen, dim=-1)
     pred_token = lm_log_p_gen.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1).float()
     loss_mask = build_response_mask(token_ids, response_start, eos_id)
+    if return_entropy:
+        # Token-level entropy H[pi(.|s_t)] = -sum_v p log p over the full vocab.
+        # Detached: used for diagnostics, not for the loss.
+        with torch.no_grad():
+            entropy = -(lm_log_p_gen.exp() * lm_log_p_gen).sum(-1).float()
+        return pred_token, loss_mask, entropy
     return pred_token, loss_mask
 
 
@@ -415,13 +492,28 @@ def run_validation(
     return correct.item(), total.item()
 
 
+# Dr.GRPO (Liu et al. 2024, "Understanding R1-Zero-Like Training")
+# advantage: A^(k) = r^(k) - mean(r), no std normalization.
+#
+# The original GRPO advantage A^(k) = (r^(k) - mu_r) / (sigma_r + eps)
+# is a biased estimator of the policy gradient: sigma_r is a nonlinear
+# function of every r^(j) in the group (including r^(k)), so the
+# control-variate identity that justifies subtracting a baseline does
+# not extend to dividing by it. The bias upweights low-variance
+# (easy / hard) prompts and downweights high-variance ones, distorting
+# the per-prompt learning signal.
+#
+# Dropping sigma_r recovers the standard control-variate proof:
+# E[(r^(k) - mu_r) * grad log pi^(k)] = (1 - 1/K) * grad J(theta)
+# per prompt, where the (1 - 1/K) factor is a constant scale absorbed
+# into the learning rate. This matches Theorem 4.4 of the revised
+# draft (research_draft_revised.tex).
 def compute_group_advantages(rewards, num_rollouts):
     if rewards.numel() == 0:
         return rewards
     grouped = rewards.view(-1, num_rollouts)
     group_mean = grouped.mean(dim=1, keepdim=True)
-    group_std = grouped.std(dim=1, keepdim=True, unbiased=False)
-    advantages = (grouped - group_mean) / (group_std + 1e-8)
+    advantages = grouped - group_mean
     return advantages.reshape(-1)
 
 
@@ -440,17 +532,28 @@ def configure_dropout(model_config, dropout):
             setattr(model_config, attr, dropout)
 
 
-# V2: variational variant. Attention dropout cannot be made variational by
-# RNG restore alone (mask shape grows with kv-cache length), so we zero it
-# and set every other dropout to the requested rate. The remaining
-# dropouts all act on tensors of shape (B, 1, H) at each latent step, where
-# CoconutVariational's RNG-restore yields a true locked mask across t.
-ATTENTION_DROPOUT_ATTRS = {
-    "attention_dropout",
-    "attention_probs_dropout_prob",
-}
-
-
+# V2 (revised): variational variant.
+#
+# Original V2 plan: zero attention_dropout because its mask shape grows
+# with kv-cache length, breaking the RNG-restore variational trick.
+#
+# Reality: Qwen2 / LLaMA / Mistral / Gemma decoders have NO residual,
+# MLP, or embedding dropout in their architectures. attention_dropout
+# is the only dropout layer that exists. Zeroing it leaves the model
+# with zero stochasticity, all rollouts collapse to identical
+# generations, and group advantages are 0.
+#
+# Resolution: leave attention_dropout at the configured rate. On these
+# architectures, the variational interpretation degrades to "regular
+# per-step dropout on attention probs" (mask shape varies with t), but
+# the GRPO proof framework (Theorem 4.4 rho_old==1, Prop 4.5 CRN
+# coupling) is unaffected because those only require xi to be
+# theta-independent and replayable, not strictly variational.
+#
+# For models that DO have residual / MLP dropout (GPT-2 family), this
+# function still routes the configured rate to those layers, where the
+# RNG-restore in CoconutVariational does produce a true locked mask
+# across t -- giving the clean Bayesian story for those layers.
 def configure_variational_dropout(model_config, dropout):
     for attr in [
         "attention_dropout",
@@ -463,8 +566,7 @@ def configure_variational_dropout(model_config, dropout):
         "summary_first_dropout",
     ]:
         if hasattr(model_config, attr):
-            value = 0.0 if attr in ATTENTION_DROPOUT_ATTRS else dropout
-            setattr(model_config, attr, value)
+            setattr(model_config, attr, dropout)
 
 
 def main():
@@ -642,6 +744,9 @@ def main():
     for param in ref_model.parameters():
         param.requires_grad_(False)
 
+    if configs.verify_replay_embeddings:
+        model.enable_mask_audit(strict=True)
+
     parallel_model = DDP(model, device_ids=[local_rank])
     del model
 
@@ -669,8 +774,9 @@ def main():
 
         if train_path_secondary != "None" and dataset_mix_ratio < 1.0:
             n_primary = int(total_train_samples * dataset_mix_ratio)
-            n_secondary = total_train_samples - n_primary
             base_dataset_primary = get_dataset(configs.train_path, tokenizer, max_size=n_primary)
+
+            n_secondary = total_train_samples - len(base_dataset_primary)
             base_dataset_secondary = get_dataset(train_path_secondary, tokenizer, max_size=n_secondary)
             from datasets import concatenate_datasets
 
@@ -708,7 +814,7 @@ def main():
     eta_min = configs.lr * 0.1
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        start_factor=1e-6 / configs.lr,
+        start_factor=2e-7 / configs.lr,
         end_factor=1.0,
         total_iters=warmup_steps,
     )
@@ -803,6 +909,7 @@ def main():
             ref_save_dir = os.path.join(save_dir, "ref_models")
             os.makedirs(ref_save_dir, exist_ok=True)
             log_path = os.path.join(save_dir, f"checkpoint_{epoch + 1}.log")
+            best_eval_acc = 0.0
 
             for step, batch in enumerate(train_dataloader):
                 if (step + 1) % 100 == 0:
@@ -820,7 +927,7 @@ def main():
                 if configs.ref_model_renewal_steps > 0:
                     ref_refresh_every = (
                         configs.ref_model_renewal_steps // 10
-                        if current_step <= warmup_steps
+                        if current_step <= warmup_steps and configs.enable_faster_warmup_renewal
                         else configs.ref_model_renewal_steps
                     )
                     if ref_refresh_every > 0 and current_step % ref_refresh_every == 0:
@@ -842,6 +949,7 @@ def main():
                 all_prompt_ids = []
                 all_prompt_masks = []
                 all_rollout_rng_states = []
+                all_chunk_accuracies = []
                 all_correct = 0
                 all_total = 0
                 n_latents_correct_sum = 0
@@ -865,7 +973,7 @@ def main():
                 rollout_chunk_size = getattr(
                     configs,
                     "rollout_chunk_size",
-                    getattr(configs, "policy_minibatch_size", configs.train_minibatch_size * 8),
+                    getattr(configs, "policy_minibatch_size", configs.train_minibatch_size * 4),
                 )
                 policy_mb_size = getattr(configs, "policy_minibatch_size", rollout_chunk_size)
 
@@ -876,6 +984,15 @@ def main():
                 if reference_model_mode == "dropout_matched" and strict_replay_structure and rollout_chunk_size != policy_mb_size:
                     raise ValueError(
                         "Dropout-matched reference replay also requires rollout_chunk_size == policy_minibatch_size"
+                    )
+                # V7: group filter requires one chunk == one group so the
+                # chunk-aligned RNG-restore replay structure stays intact
+                # when whole groups are dropped.
+                if getattr(configs, "enable_group_filter", False) and rollout_chunk_size != configs.num_rollouts:
+                    raise ValueError(
+                        f"enable_group_filter requires rollout_chunk_size == num_rollouts "
+                        f"(got rollout_chunk_size={rollout_chunk_size}, num_rollouts={configs.num_rollouts}). "
+                        f"Set both to the same value in the YAML."
                     )
 
                 measure_timer("Batch prep")
@@ -945,6 +1062,12 @@ def main():
                         all_rollout_rng_states.append(rng_state)
                         all_correct += sum(accuracies)
                         all_total += len(accuracies)
+                        # V7: per-chunk accuracy for the group filter. With
+                        # rollout_chunk_size == num_rollouts (validated above
+                        # when the filter is enabled), one chunk == one group.
+                        all_chunk_accuracies.append(
+                            sum(accuracies) / max(len(accuracies), 1)
+                        )
                         del generated
 
                 measure_timer("Rollout generation")
@@ -982,14 +1105,14 @@ def main():
                 wandb_step_payload = None
                 if wandb_run and rank == 0:
                     wandb_step_payload = {
-                        "train/epoch": epoch + 1,
-                        "train/step": step + 1,
-                        "train/global_step": global_step,
-                        "train/batch_avg_reward": avg_reward,
-                        "train/batch_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
-                        "train/batch_accuracy": all_correct / max(all_total, 1),
-                        "train/batch_n_latent_avg": num_latents,
-                        "train/batch_n_latent_correct_avg": n_latents_correct_sum / n_latents_correct_num if n_latents_correct_num > 0 else 0,
+                        "train_stat/epoch": epoch + 1,
+                        "train_stat/step": step + 1,
+                        # "train/global_step": global_step,
+                        "train_rollout/batch_avg_reward": avg_reward,
+                        "train_rollout/batch_avg_base_reward": sum(all_base_rewards) / max(len(all_base_rewards), 1),
+                        "train_rollout/batch_accuracy": all_correct / max(all_total, 1),
+                        "train_rollout/batch_n_latent_avg": num_latents,
+                        "train_rollout/batch_n_latent_correct_avg": n_latents_correct_sum / n_latents_correct_num if n_latents_correct_num > 0 else 0,
                     }
                     if log_first_batch_outputs_table:
                         wandb_step_payload["train/first_batch_outputs"] = build_first_batch_outputs_table(
@@ -1003,6 +1126,135 @@ def main():
                             all_base_rewards=all_base_rewards,
                         )
 
+                # Group-Level Filter #############################################################################################################
+                # V7: drop whole groups whose accuracy is outside
+                # [filter_min_accuracy, filter_max_accuracy] before any
+                # downstream replay or policy update. Saves ~25% of step
+                # time on filtered groups (theta_old replay + ref replay +
+                # policy backward) and concentrates compute on "marginal"
+                # prompts where the gradient signal is strongest.
+                # Curriculum-friendly: as the policy improves, easy
+                # (acc -> 1) and hard (acc -> 0) groups drop out
+                # automatically.
+                #
+                # Constraint: rollout_chunk_size == num_rollouts (validated
+                # at step start) so each chunk corresponds to exactly one
+                # group. Filtering whole chunks preserves the chunk-aligned
+                # RNG-restore replay structure required for variational
+                # dropout bit-exact reproduction.
+                #
+                # Diagnostics: wandb logs train_rollout/filter_kept_frac
+                # (fraction of groups passing the filter). Pre-filter
+                # rollout stats (batch_avg_reward, batch_accuracy,
+                # first_batch_outputs) reflect the full batch; downstream
+                # stats (frac_zero_var_groups, adv_abs_mean, etc.) are
+                # computed on the filtered subset.
+                filter_kept_frac = 1.0
+                skip_step = False
+                if getattr(configs, "enable_group_filter", False):
+                    filter_min = getattr(configs, "filter_min_accuracy", 0.05)
+                    filter_max = getattr(configs, "filter_max_accuracy", 0.95)
+                    chunk_keep = [
+                        filter_min <= acc <= filter_max
+                        for acc in all_chunk_accuracies
+                    ]
+                    n_kept = sum(chunk_keep)
+                    n_chunks = len(chunk_keep)
+
+                    # All-reduce the kept count so every rank makes the
+                    # same skip decision. DDP requires backward() to run
+                    # in lockstep across ranks; if some ranks skip and
+                    # others don't, the participating ranks hang on grad
+                    # sync. We coordinate globally:
+                    #   global == 0 -> all ranks skip the policy update
+                    #     (no optimizer.step, no lr_scheduler.step). Avoids
+                    #     the pure-KL drag the prior fallback introduced
+                    #     when zero-var groups were forced through.
+                    #   global > 0 but local == 0 -> this rank participates
+                    #     via local fallback (use all its chunks). Its
+                    #     pure-KL gradient is diluted by 1/world_size in
+                    #     the DDP gradient average.
+                    n_kept_tensor = torch.tensor(n_kept, device=device, dtype=torch.long)
+                    dist.all_reduce(n_kept_tensor, op=dist.ReduceOp.SUM)
+                    n_kept_global = n_kept_tensor.item()
+
+                    if n_kept_global == 0:
+                        if rank == 0:
+                            print(
+                                f"[Step {step + 1}] No groups passed filter "
+                                f"[{filter_min}, {filter_max}] on any rank; "
+                                f"skipping policy update."
+                            )
+                        skip_step = True
+                        filter_kept_frac = 0.0
+                    elif n_kept == 0:
+                        chunk_keep = [True] * n_chunks
+                        n_kept = n_chunks
+                        filter_kept_frac = 0.0
+                    else:
+                        filter_kept_frac = n_kept / max(n_chunks, 1)
+
+                    if not skip_step and n_kept < n_chunks:
+                        # Apply filter to chunk-level lists.
+                        all_token_ids = [
+                            t for t, k in zip(all_token_ids, chunk_keep) if k
+                        ]
+                        all_prompt_ids = [
+                            t for t, k in zip(all_prompt_ids, chunk_keep) if k
+                        ]
+                        all_prompt_masks = [
+                            t for t, k in zip(all_prompt_masks, chunk_keep) if k
+                        ]
+                        all_rollout_rng_states = [
+                            s for s, k in zip(all_rollout_rng_states, chunk_keep) if k
+                        ]
+                        # Apply filter to rollout-level rewards (chunks of
+                        # num_rollouts each).
+                        filtered_rewards = []
+                        for chunk_idx, keep in enumerate(chunk_keep):
+                            if keep:
+                                start = chunk_idx * configs.num_rollouts
+                                end = start + configs.num_rollouts
+                                filtered_rewards.extend(all_rewards[start:end])
+                        all_rewards = filtered_rewards
+                        # Slice generated_all to keep only filtered rows.
+                        row_keep = []
+                        for keep in chunk_keep:
+                            row_keep.extend([keep] * configs.num_rollouts)
+                        row_keep_tensor = torch.tensor(
+                            row_keep, dtype=torch.bool, device=generated_all.device
+                        )
+                        generated_all = generated_all[row_keep_tensor]
+
+                if wandb_step_payload is not None:
+                    wandb_step_payload["train_rollout/filter_kept_frac"] = filter_kept_frac
+
+                measure_timer("Group filter")
+
+                # Skip-step short-circuit: when the global filter dropped
+                # every group, log rollout/filter stats only and move to
+                # the next batch. lr_scheduler and optimizer are NOT
+                # stepped (skipped step = no progress at all). Periodic
+                # eval might miss firing if its trigger step coincides
+                # with a skip, but with a sane filter this is rare and
+                # the next non-skipped step still triggers eval normally.
+                if skip_step:
+                    if wandb_step_payload is not None:
+                        wandb_run.log(wandb_step_payload, step=global_step)
+                    pbar.update(1)
+                    pbar.set_description(
+                        f"GRPO Epoch: {epoch + 1}/{configs.num_epochs}, "
+                        f"step {step}/{len(train_dataloader)} (skipped: filter empty)"
+                    )
+                    del all_token_ids, all_prompt_ids, all_prompt_masks, all_rollout_rng_states
+                    del repeated_input_ids, repeated_attention_mask
+                    del generated_all, padded_token_ids, wandb_step_payload
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    measure_timer("Step cleanup (skipped)")
+                    torch.cuda.reset_peak_memory_stats()
+                    continue
+
                 # Advantage Calculation ##########################################################################################################
 
                 prompt_ids_cpu = torch.cat(all_prompt_ids, dim=0).to(device)
@@ -1010,6 +1262,36 @@ def main():
                 token_ids = generated_all.to(device)
                 reward_tensor = torch.tensor(all_rewards, device=device, dtype=torch.float32)
                 advantages = compute_group_advantages(reward_tensor, configs.num_rollouts)
+
+                adv_clip = getattr(configs, "advantage_clip", 5.0)          # clip against advantage blow-up in near-uniform cases
+                advantages = advantages.clamp(min=-adv_clip, max=adv_clip)
+
+                # Advantage Diagnostics ##########################################################################################################
+                # Reward / advantage signal health checks. Stagnant loss + high
+                # grad_norm is usually caused by zero-variance groups (advantage
+                # collapses to 0, gradient is pure KL noise). These metrics
+                # surface that case directly.
+                #   reward_std_within_group: mean within-group reward std.
+                #     Healthy > 0.1, dead < 1e-3 (groups uniform -> no signal).
+                #   adv_abs_mean: mean |advantage| over rollouts.
+                #     Healthy > 0.3, dead < 1e-2.
+                #   adv_zero_frac: fraction of rollouts with |adv| < 1e-6.
+                #     Healthy < 0.3, dead > 0.7.
+                #   frac_zero_var_groups: fraction of groups with std == 0
+                #     (all rollouts identical reward -> contributes nothing
+                #     to gradient). Tests bimodal-difficulty hypothesis:
+                #     easy prompts get all-correct, hard prompts get all-
+                #     wrong, only medium prompts produce signal. Healthy
+                #     < 0.3, problematic > 0.5.
+                with torch.no_grad():
+                    reward_grouped = reward_tensor.view(-1, configs.num_rollouts)
+                    group_std = reward_grouped.std(dim=1)
+                    reward_std_within_group = group_std.mean().item()
+                    frac_zero_var_groups = (group_std < 1e-6).float().mean().item()
+                    adv_abs = advantages.abs()
+                    adv_abs_mean = adv_abs.mean().item()
+                    adv_abs_max = adv_abs.max().item()
+                    adv_zero_frac = (adv_abs < 1e-6).float().mean().item()
 
                 # Theta_old Replay ###############################################################################################################
                 # D1: replay generated tokens through current parallel_model
@@ -1103,16 +1385,83 @@ def main():
 
                 measure_timer("Reference replay")
 
+                # Zero-Variance Group Masking ################################################################################################
+                # DAPO-style "Dynamic Sampling" (Yu et al. 2024). Groups
+                # with std == 0 (all rollouts identical reward) contribute
+                # zero policy gradient -- their advantages are 0 by
+                # construction. Without this mask, those tokens still
+                # incur KL pull toward pi_ref, which uses up the KL
+                # budget on uninformative samples and drowns the real
+                # policy signal. Multiplying ref_loss_mask by the per-
+                # rollout valid mask removes them from BOTH policy_loss
+                # and kl_loss aggregation. total_nonmasked recomputed
+                # below uses the masked version, so the loss denominator
+                # shrinks honestly.
+                if getattr(configs, "mask_zero_var_groups", True):
+                    group_valid_per_group = (group_std > 1e-6).to(ref_loss_mask.device)
+                    group_valid_per_rollout = group_valid_per_group.repeat_interleave(
+                        configs.num_rollouts
+                    )
+                    effective_batch_frac = group_valid_per_group.float().mean().item()
+                    ref_loss_mask = ref_loss_mask * group_valid_per_rollout.to(
+                        ref_loss_mask.dtype
+                    ).unsqueeze(-1)
+                else:
+                    effective_batch_frac = 1.0
+
                 # Policy Update ############################################################################################################
 
                 total_rollouts = token_ids.shape[0]
                 total_nonmasked = ref_loss_mask.sum().clamp(min=1)
                 max_log_ratio = torch.tensor(0.0, device=device)
                 max_log_ratio_ref = torch.tensor(0.0, device=device)
+                # Ref-drift diagnostics (sums weighted by ref_loss_mask;
+                # divided by sum_log_ratio_count after the loop to get means).
+                sum_log_ratio_ref_abs = torch.tensor(0.0, device=device)
+                sum_clamp_count = torch.tensor(0.0, device=device)
+                sum_log_ratio_count = torch.tensor(0.0, device=device)
+                # Policy entropy diagnostics. Healthy: entropy stable or
+                # slowly decreasing. Mode collapse signature: rapid decrease
+                # toward 0 prior to reward collapse.
+                sum_entropy = torch.tensor(0.0, device=device)
+                sum_entropy_count = torch.tensor(0.0, device=device)
                 step_loss = 0.0
+                # policy_loss diagnostics, mask-weighted across the step.
+                # Post-Dr.GRPO advantages sum to zero within each group, so
+                # E[mb_policy_loss] is ~0 (sanity-check metric, kept as
+                # sum_policy_loss). The actual gradient-flowing magnitude
+                # is sum_policy_loss_abs = mean(|mb_policy_loss|), which
+                # measures clipped per-token signal strength. Healthy:
+                # roughly stable / slowly drifting. Collapse signature:
+                # decay toward 0 prior to reward / accuracy plateau.
+                sum_policy_loss = torch.tensor(0.0, device=device)
+                sum_policy_loss_abs = torch.tensor(0.0, device=device)
+                sum_policy_signal = torch.tensor(0.0, device=device)
+                sum_kl_loss = 0.0
 
                 optimizer.zero_grad()
                 parallel_model.module.train()
+
+                # KL annealing: scale kl_beta by current_lr / peak_lr so the
+                # KL trust-region pull shrinks proportionally with the step
+                # size. Without this, late-training (lr cosine-annealed to
+                # eta_min) leaves a constant KL pull on a shrinking step,
+                # which drags theta back toward the frozen ref ("trust-region
+                # collapse"). With annealing, each step has the same fraction
+                # of trust region. During warmup lr ramps from ~0 to peak,
+                # so kl_beta also ramps up, letting the policy update freely
+                # while still warming.
+                current_kl_beta = configs.kl_beta * (
+                    optimizer.param_groups[0]["lr"] / configs.lr
+                )
+
+                # Sequence-mean denominator: count rollouts that have at
+                # least one unmasked response token. Zero-var groups are
+                # already zeroed by ref_loss_mask (DAPO masking above), so
+                # they don't contribute and aren't counted.
+                total_valid_seqs = (
+                    (ref_loss_mask.sum(dim=-1) > 0).sum().clamp(min=1).float()
+                )
 
                 for mb_start in range(0, total_rollouts, policy_mb_size):
                     mb_end = min(mb_start + policy_mb_size, total_rollouts)
@@ -1137,12 +1486,13 @@ def main():
                         attention_mask=mb_mask,
                         replay_generated_ids=mb_tok,
                     )
-                    mb_new_lp, _ = compute_log_probs(
+                    mb_new_lp, _, mb_entropy = compute_log_probs(
                         mb_tok,
                         mb_new_outputs,
                         prompt_len,
                         num_latents,
                         tokenizer.eos_token_id,
+                        return_entropy=True,
                     )
 
                     # PPO clip on rho = pi_theta / pi_{theta_old} (eq 4.6).
@@ -1158,15 +1508,63 @@ def main():
                     t1 = mb_ratio * mb_adv.unsqueeze(-1)
                     t2 = mb_clipped * mb_adv.unsqueeze(-1)
                     mb_policy_loss = -torch.min(t1, t2)
+                    # Mask-weighted policy_loss diagnostics. Aggregate sums
+                    # here; divide once at log time by sum_log_ratio_count.
+                    mask_f_loss = mb_ref_mask.float()
+                    mb_pl_det = mb_policy_loss.detach()
+                    sum_policy_loss = sum_policy_loss + (mb_pl_det * mask_f_loss).sum()
+                    sum_policy_loss_abs = sum_policy_loss_abs + (mb_pl_det.abs() * mask_f_loss).sum()
+                    sum_policy_signal = sum_policy_signal + (t1.detach().abs() * mask_f_loss).sum()
 
-                    # k3 KL estimator against pi_ref (eq 4.7 KL term).
+                    # Huberized k3 KL estimator against pi_ref (eq 4.7 KL term).
+                    # Inside |r| <= delta: standard k3, exp(r) - r - 1.
+                    # Outside: linear extension matched in value AND slope at
+                    # +/- delta, so the KL stays continuously differentiable
+                    # and the gradient stays nonzero in the tails. The prior
+                    # log_ratio.clamp(-5, 5) zeroed the gradient outside the
+                    # bound (autograd of clamp is 0 there), letting drifted
+                    # tokens escape KL regularization entirely -- the
+                    # pre-collapse signature on long runs.
                     mb_log_ratio_ref = mb_new_lp - mb_ref_lp
-                    mb_log_ratio_ref_clamped = mb_log_ratio_ref.clamp(-5, 5)
-                    mb_ratio_ref = torch.exp(mb_log_ratio_ref_clamped)
-                    mb_kl = mb_ratio_ref - mb_log_ratio_ref_clamped - 1.0
+                    kl_huber_delta = getattr(configs, "kl_huber_delta", 5.0)
+                    e_pos = math.exp(kl_huber_delta)
+                    e_neg = math.exp(-kl_huber_delta)
+                    # exp on clamped r is finite everywhere; gradient through
+                    # this branch only flows where torch.where selects it
+                    # (|r| <= delta), where r_clamped == r so the gradient
+                    # matches the unclamped k3 gradient exp(r) - 1.
+                    r_clamped = mb_log_ratio_ref.clamp(-kl_huber_delta, kl_huber_delta)
+                    kl_inside = torch.exp(r_clamped) - mb_log_ratio_ref - 1.0
+                    kl_pos = (e_pos - 1.0) * (mb_log_ratio_ref - kl_huber_delta) + (
+                        e_pos - kl_huber_delta - 1.0
+                    )
+                    kl_neg = (e_neg - 1.0) * (mb_log_ratio_ref + kl_huber_delta) + (
+                        e_neg + kl_huber_delta - 1.0
+                    )
+                    mb_kl = torch.where(
+                        mb_log_ratio_ref > kl_huber_delta,
+                        kl_pos,
+                        torch.where(
+                            mb_log_ratio_ref < -kl_huber_delta,
+                            kl_neg,
+                            kl_inside,
+                        ),
+                    )
+                    sum_kl_loss += mb_kl.detach().mean().item()
 
-                    mb_total_loss = mb_policy_loss + configs.kl_beta * mb_kl
-                    mb_loss = (mb_total_loss * mb_ref_mask).sum() / total_nonmasked
+                    mb_total_loss = mb_policy_loss + current_kl_beta * mb_kl
+                    # Sequence-mean (per draft Algorithm 1 / standard GRPO):
+                    # average per-token loss within each rollout, then average
+                    # across rollouts. Token-mean (sum / total_tokens) under-
+                    # weights short responses and entangles per-sequence weight
+                    # with sequence length. Zero-var rollouts are zeroed in
+                    # mb_ref_mask so they contribute 0 / max(0,1) = 0 here, and
+                    # are excluded from total_valid_seqs.
+                    mb_per_seq_token_count = mb_ref_mask.sum(dim=-1).clamp(min=1)
+                    mb_per_seq_loss = (
+                        mb_total_loss * mb_ref_mask
+                    ).sum(dim=-1) / mb_per_seq_token_count
+                    mb_loss = mb_per_seq_loss.sum() / total_valid_seqs
 
                     mb_loss.backward()
                     step_loss += mb_loss.item()
@@ -1179,26 +1577,129 @@ def main():
                             max_log_ratio_ref,
                             mb_log_ratio_ref.detach().abs().max(),
                         )
+                        # Mask-weighted accumulators for mean and clamp fraction
+                        # of |log_ratio_ref|. Aggregated across minibatches and
+                        # divided once at log time below.
+                        log_ratio_ref_abs = mb_log_ratio_ref.detach().abs()
+                        mask_f = mb_ref_mask.float()
+                        sum_log_ratio_ref_abs = sum_log_ratio_ref_abs + (log_ratio_ref_abs * mask_f).sum()
+                        sum_clamp_count = sum_clamp_count + ((log_ratio_ref_abs > 5.0).float() * mask_f).sum()
+                        sum_log_ratio_count = sum_log_ratio_count + mask_f.sum()
+                        # Mask-weighted policy entropy.
+                        if mb_entropy.numel() > 0:
+                            sum_entropy = sum_entropy + (mb_entropy * mask_f).sum()
+                            sum_entropy_count = sum_entropy_count + mask_f.sum()
+                    del mb_entropy
                     del mb_new_outputs, mb_new_lp, mb_log_ratio, mb_log_ratio_clamped
                     del mb_ratio, mb_clipped, t1, t2, mb_policy_loss
-                    del mb_log_ratio_ref, mb_log_ratio_ref_clamped, mb_ratio_ref, mb_kl
-                    del mb_total_loss, mb_loss
+                    del mb_log_ratio_ref, r_clamped, kl_inside, kl_pos, kl_neg, mb_kl
+                    del mb_total_loss, mb_loss, mb_per_seq_loss, mb_per_seq_token_count
                     del mb_prompt, mb_mask, mb_tok, mb_adv, mb_old_lp, mb_ref_lp, mb_ref_mask
 
                 measure_timer("Policy replay")
 
-                torch.nn.utils.clip_grad_norm_(parallel_model.parameters(), max_norm=1.0)
+                # clip_grad_norm_ returns the total pre-clip L2 norm across
+                # all parameters. Spike at end of LR warmup or pre-collapse
+                # is the diagnostic signature of an LR that is too high.
+                grad_clip_norm = getattr(configs, "grad_clip_norm", 0.5)
+                pre_clip_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parallel_model.parameters(), max_norm=grad_clip_norm
+                )
                 optimizer.step()
                 lr_scheduler.step()
 
                 if wandb_step_payload is not None:
+                    log_ratio_count = sum_log_ratio_count.clamp(min=1)
+                    mean_log_ratio_ref = (sum_log_ratio_ref_abs / log_ratio_count).item()
+                    clamp_frac_ref = (sum_clamp_count / log_ratio_count).item()
+                    entropy_count = sum_entropy_count.clamp(min=1)
+                    mean_entropy = (sum_entropy / entropy_count).item()
+                    # policy_loss_signed is the mask-weighted mean of
+                    # -min(rho*A, clip*A). Post-Dr.GRPO it sits near 0
+                    # because A^(k) sums to zero per group; deviation from
+                    # 0 measures clip-induced asymmetry. policy_loss_abs
+                    # is the mask-weighted mean of |min(rho*A, clip*A)| --
+                    # the actual gradient-flowing magnitude. policy_signal
+                    # is the pre-clip mean of |rho*A|; ratio
+                    # policy_loss_abs / policy_signal measures clip
+                    # bite-fraction (1.0 = no clipping, < 1.0 = clip
+                    # actively dampening the update).
+                    mean_policy_loss = (sum_policy_loss / log_ratio_count).item()
+                    mean_policy_loss_abs = (sum_policy_loss_abs / log_ratio_count).item()
+                    mean_policy_signal = (sum_policy_signal / log_ratio_count).item()
+                    clip_bite_frac = (
+                        mean_policy_loss_abs / mean_policy_signal
+                        if mean_policy_signal > 1e-12
+                        else 0.0
+                    )
                     wandb_step_payload.update(
                         {
-                            "train/loss": step_loss,
-                            "train/learning_rate": optimizer.param_groups[0]["lr"],
-                            "train/max_log_ratio": max_log_ratio.item(),
-                            "train/max_log_ratio_ref": max_log_ratio_ref.item(),
-                            "train/zero_reward_frac": sum(1 for r in all_rewards if r <= 0) / max(len(all_rewards), 1),
+                            "train_stat/loss": step_loss,
+                            "train_stat/policy_loss": mean_policy_loss,
+                            "train_stat/policy_loss_abs": mean_policy_loss_abs,
+                            "train_stat/policy_signal": mean_policy_signal,
+                            "train_stat/clip_bite_frac": clip_bite_frac,
+                            "train_stat/kl_loss": sum_kl_loss / log_ratio_count,
+                            "train_stat/learning_rate": optimizer.param_groups[0]["lr"],
+                            # Annealed kl_beta = configs.kl_beta * (lr / peak_lr).
+                            # Tracks lr schedule so trust region scales with step
+                            # size. Equals configs.kl_beta at lr peak (post-warmup),
+                            # eta_min/lr * configs.kl_beta at the end of cosine.
+                            "train_stat/kl_beta": current_kl_beta,
+                            "train_policy/max_log_ratio": max_log_ratio.item(),
+                            "train_policy/max_log_ratio_ref": max_log_ratio_ref.item(),
+                            # Mean |log_ratio_ref| across non-masked tokens.
+                            # Healthy: < 1. Concerning: > 3.
+                            "train_policy/mean_log_ratio_ref": mean_log_ratio_ref,
+                            # Fraction of non-masked tokens with
+                            # |log_ratio_ref| > kl_huber_delta (default 5).
+                            # Post-Huberization, KL still has nonzero
+                            # (constant) gradient in this region, so these
+                            # tokens are still regularized -- the fraction
+                            # just measures how many tokens have entered
+                            # the linear-tail regime. Persistent high values
+                            # still indicate large drift from pi_ref.
+                            # Healthy: < 5%. Concerning: > 30%.
+                            "train_policy/clamp_frac_ref": clamp_frac_ref,
+                            "train_adv/zero_reward_frac": sum(1 for r in all_rewards if r <= 0) / max(len(all_rewards), 1),
+                            # Mean within-group reward std. Group-relative
+                            # advantages depend on within-group variance.
+                            # Healthy > 0.1, dead < 1e-3 (groups uniform).
+                            "train_adv/reward_std_within_group": reward_std_within_group,
+                            # Fraction of groups with std == 0 (all rollouts
+                            # identical reward -> zero gradient contribution
+                            # from this group). High value = bimodal prompt
+                            # difficulty (easy or hard, no medium). Healthy
+                            # < 0.3, problematic > 0.5.
+                            "train_adv/frac_zero_var_groups": frac_zero_var_groups,
+                            # Fraction of groups kept after DAPO-style zero-
+                            # variance group masking (Yu et al. 2024). Equals
+                            # 1 - frac_zero_var_groups when mask is enabled.
+                            # Effective batch size = num_rollouts *
+                            # effective_batch_frac.
+                            "train_adv/effective_batch_frac": effective_batch_frac,
+                            # Mean |advantage| across rollouts. Healthy > 0.3,
+                            # dead < 1e-2 -> zero policy gradient signal.
+                            "train_adv/adv_abs_mean": adv_abs_mean,
+                            # Max |advantage| post-clip. If consistently at
+                            # advantage_clip ceiling, near-uniform groups are
+                            # blowing up the normalization (eps in
+                            # compute_group_advantages too small) -- spike
+                            # source for grad_norm.
+                            "train_adv/adv_abs_max": adv_abs_max,
+                            # Fraction of rollouts with |adv| < 1e-6. Healthy
+                            # < 0.3, dead > 0.7. High value = groups uniform
+                            # (all-correct or all-wrong), no learning signal.
+                            "train_adv/adv_zero_frac": adv_zero_frac,
+                            # Mean policy entropy over response tokens.
+                            # Mode collapse signature: rapid decrease toward 0.
+                            "train_policy/policy_entropy": mean_entropy,
+                            # Total pre-clip gradient L2 norm. Healthy:
+                            # roughly stable. Spike at end of warmup ->
+                            # peak LR is too high.
+                            "train_policy/grad_norm": pre_clip_grad_norm.item()
+                            if torch.is_tensor(pre_clip_grad_norm)
+                            else float(pre_clip_grad_norm),
                         }
                     )
                     wandb_run.log(wandb_step_payload, step=global_step)
@@ -1216,6 +1717,8 @@ def main():
                 del all_token_ids, all_prompt_ids, all_prompt_masks, all_rollout_rng_states
                 del repeated_input_ids, repeated_attention_mask
                 del ref_lp_chunks, ref_mask_chunks
+                del sum_log_ratio_ref_abs, sum_clamp_count, sum_log_ratio_count
+                del sum_entropy, sum_entropy_count
                 del wandb_step_payload
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1256,6 +1759,13 @@ def main():
                                 },
                                 step=global_step,
                             )
+
+                        if not configs.save_only_improve or eval_acc >= best_eval_acc or (step + 1) % configs.mandatory_save_per_epochs == 0:
+                            ckpt_path_eval = os.path.join(save_dir, "ref_models", f"checkpoint_{epoch + 1}_step_{step + 1}_{int(eval_acc * 10000)}.pt")
+                            save_model(parallel_model, ckpt_path_eval)
+                            if eval_acc > best_eval_acc:
+                                best_eval_acc = eval_acc
+
                     measure_timer("Periodic eval")
                     torch.cuda.reset_peak_memory_stats()
 

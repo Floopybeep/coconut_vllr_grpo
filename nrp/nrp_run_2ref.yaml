@@ -28,7 +28,7 @@ spec:
           
           # 2. Launch the single WandB agent for this specific pod
           echo "Starting Training..."
-          torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout.py args/gsm_dropout.yaml
+          torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_2ref.py args/gsm_dropout.yaml
         
         resources:
           limits:

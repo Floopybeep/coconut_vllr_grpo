@@ -1,0 +1,870 @@
+╭─── Claude Code v2.1.119 ─────────────────────────────────────────────────────╮
+│                                                │ Tips for getting started    │
+│               Welcome back Wooil!              │ Run /init to create a CLAU… │
+│                                                │ ─────────────────────────── │
+│                     ▐▛███▜▌                    │ Recent activity             │
+│                    ▝▜█████▛▘                   │ No recent activity          │
+│                      ▘▘ ▝▝                     │                             │
+│                                                │                             │
+│             Opus 4.7 · Claude Pro              │                             │
+│   /…/260116_latent_space_LLM/coconut_dropout   │                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+❯ I have a research idea that I am trying to formulate using concrete           
+  mathematical proofs, but I am having some trouble.                            
+  My idea is using dropout as a stochasticity generator for latent reasoning    
+  LLM model fine-tuning, specifically GRPO on math datasets.                    
+  The latent reasoning model in question follows the Coconut model from Hao et  
+  al, which uses the previous time-step's hidden states as input to the next    
+  time-step during latent reasoning.                                            
+  The problem here is that latent reasoning steps are deterministic in nature,  
+  so you cannot just sample the next token as you would in language modeling.   
+  To resolve this, I am proposing to use a small dropout(~10%) during rollout   
+  generation in order to generate a diverse hidden state.                       
+  The dropout-generated answers will be graded and ranked to group-normalized   
+  advantages.                                                                   
+  During the policy update, the exact same dropout mask will be applied to the  
+  model to replicate the exact same hidden states during generation, and then   
+  backpropagated accordingly whether the latent trajectory generated a correct  
+  answer or not.                                                                
+                                                                                
+  My initial hypothesis was that this can be modeled as a group of similar      
+  parameters to the "true" model parameters, but I am encountering trouble      
+  proceeding from this point.                                                   
+  Help me formulate a concrete mathematical induction that demonstrates a       
+  viable proof that this technique will work.                                   
+
+● Here's framework. Math kept rigorous; prose compressed.
+
+  1. Formal setup
+
+  Let model params θ. Dropout mask ξ ~ p(ξ), independent of θ. Define perturbed
+  params:
+
+  $$\tilde\theta(\xi) = \theta \odot m(\xi)/q$$
+
+  where m(ξ) ∈ {0,1}^d Bernoulli(q), so E_ξ[m(ξ)/q] = 1.
+
+  Coconut latent recurrence with dropout, t = 1,...,T:
+
+  $$h_t = f_{\tilde\theta_t(\xi_t)}(h_{t-1}), \quad h_0 = \text{embed}(x)$$
+
+  Final answer tokens y_1,...,y_L sampled from π_θ(· | x, h_T) standard
+  autoregressive (token sampling stochastic; can fold into ξ too).
+
+  Joint noise: ξ = (ξ_1, ..., ξ_T). Trajectory τ = (h_1,...,h_T, y_1,...,y_L).
+
+  2. Key reframing — ξ as exogenous noise (reparameterization)
+
+  Crucial point: p(ξ) does not depend on θ. So policy factors as
+
+  $$\pi_\theta(\tau, \xi \mid x) = p(\xi),\pi_\theta(\tau \mid x,\xi)$$
+
+  Given ξ fixed, latent path h_{1:T} is deterministic function of θ. Only
+  token-level y_{1:L} retains stochasticity (or also reparameterized via Gumbel
+  if you fold sampling noise into ξ).
+
+  This is exactly the reparameterization trick (Kingma & Welling 2014) / common 
+  random numbers (CRN, Glasserman & Yao 1992) setup. Replaying same ξ at
+  policy-update time = CRN variance reduction.
+
+  3. Induction on latent depth T
+
+  Claim: ∇_θ log π_θ(y | x, ξ) is well-defined and computable via backprop
+  through the unrolled latent graph for any T, when ξ is fixed.
+
+  Base (T=0): No latent steps. Standard token policy:
+  $$\nabla_\theta \log \pi_\theta(y\mid x) = \sum_\ell \nabla_\theta \log
+  \pi_\theta(y_\ell \mid x, y_{<\ell})$$
+  Standard, holds.
+
+  Inductive step: Assume well-defined for T−1 latent steps. For T steps,
+  $$h_T = f_{\tilde\theta_T(\xi_T)}(h_{T-1}(\theta, \xi_{<T}, x))$$
+  Chain rule:
+  $$\frac{\partial h_T}{\partial \theta} = \underbrace{\frac{\partial
+  f}{\partial \tilde\theta_T}\frac{\partial \tilde\theta_T}{\partial
+  \theta}}{\text{direct, mask-scaled}} + \underbrace{\frac{\partial f}{\partial 
+  h{T-1}}\frac{\partial h_{T-1}}{\partial \theta}}_{\text{recursive, by IH}}$$
+
+  Both terms exist; ∂h_{T-1}/∂θ exists by inductive hypothesis. Token log-probs
+  are smooth in h_T. Thus
+
+  $$\nabla_\theta \log \pi_\theta(y \mid x, \xi) = \sum_\ell \nabla_{h_T}
+  \log\pi_\theta(y_\ell \mid \cdot),\frac{\partial h_T}{\partial \theta} +
+  \nabla_\theta^{\text{direct}}\log\pi_\theta(y_\ell\mid\cdot)$$
+
+  is well-defined for all T. ∎
+
+  4. Unbiasedness of dropout-GRPO
+
+  Define ξ-conditional surrogate (PPO/GRPO clipped form):
+
+  $$\mathcal{L}^{\text{GRPO}}(\theta;\xi,y,x) = \min!\Big(\rho_\theta(\xi,y) A,\
+   \text{clip}(\rho_\theta,1-\epsilon,1+\epsilon)A\Big)$$
+
+  with importance ratio
+  $$\rho_\theta(\xi,y) = \frac{\pi_\theta(y\mid
+  x,\xi)}{\pi_{\theta_{\text{old}}}(y\mid x,\xi)}$$
+
+  and group-normalized advantage A computed from rewards of group of K rollouts
+  {(ξ^k, y^k)} sharing x.
+
+  Theorem (unbiased policy gradient under CRN replay): At θ = θ_old,
+
+  $$\mathbb{E}{\xi,y}\big[\nabla\theta
+  \mathcal{L}^{\text{GRPO}}\big]\Big|{\theta=\theta\text{old}} =
+  \mathbb{E}{\xi,y}\big[A \cdot \nabla\theta \log \pi_\theta(y\mid x,\xi)\big]$$
+
+  which equals ∇_θ J(θ) for the augmented policy
+
+  $$\Pi_\theta(y,\xi\mid x) := p(\xi),\pi_\theta(y\mid x,\xi)$$
+
+  since ∇_θ log p(ξ) = 0.
+
+  Why replay matters (variance): Without replay you compute ρ_θ using a
+  different ξ' than rollout — ratio numerator and denominator differ in two
+  sources (θ change AND noise change). With replay,
+  $$\text{Var}[\hat g_{\text{CRN}}] \le \text{Var}[\hat g_{\text{indep}}]$$
+  by standard CRN coupling argument: covariance term is positive when r(τ) is
+  monotone in shared randomness.
+
+  5. The "group of similar parameters" formalization
+
+  Your intuition maps cleanly onto Bayesian-dropout view (Gal & Ghahramani
+  2016): each ξ defines posterior sample θ̃(ξ). The augmented policy is the
+  marginal
+
+  $$\pi_\theta(y\mid x) = \int p(\xi)\pi_\theta(y\mid x,\xi),d\xi =
+  \mathbb{E}{\theta'\sim q\theta}[\pi_{\theta'}(y\mid x)]$$
+
+  GRPO with replayed dropout = per-sample MAP gradient within ensemble:
+
+  $$\nabla_\theta J = \mathbb{E}{\xi}\big[\nabla\theta
+  J(\tilde\theta(\xi))\cdot\nabla_\theta\tilde\theta(\xi)\big]$$
+
+  Group normalization across K different ξ samples = Monte Carlo estimate over
+  ensemble members, with control-variate baseline = group mean reward.
+
+  6. What still needs care (gaps to close)
+
+  - Token-distribution mode collapse: if final token sampling is the only true
+  stochastic source, dropout perturbations to h_T may not change argmax → zero
+  gradient signal on many rollouts. Verify h_T sensitivity empirically.
+  - Ratio explosion: ρ_θ(ξ,y) under dropout can be large because dropping
+  different units changes logits non-smoothly. Clipping ε may need tightening;
+  consider per-step ratio clipping along latent path.
+  - CRN validity for clip operator: clip is non-smooth. Theorem 4 holds at
+  θ=θ_old (initial step) but needs Lipschitz argument for trust-region steps.
+  Standard PPO analysis (Schulman 2017 §5) extends if dropout-induced ratio
+  stays bounded.
+  - Bias from MC-dropout marginalization: during evaluation/test you typically
+  turn dropout off. Mismatch between train marginal Π_θ and deploy π_θ(no
+  dropout). Either (a) keep dropout at test, (b) bound TV-distance ‖Π_θ −
+  π_θ‖_TV ≤ O(p√d) and accept bias.
+
+  Suggested write-up structure
+
+  1. Defs (Coconut recurrence + dropout perturbation)
+  2. Lemma: ξ exogenous → reparameterization applies
+  3. Induction lemma (§3) — gradient well-defined for any T
+  4. Theorem (§4) — unbiased GRPO surrogate gradient under CRN replay
+  5. Corollary — variance reduction vs. independent-noise estimator
+  6. Connection to MC-dropout posterior (§5)
+  7. Discussion of gaps (§6)
+
+  Want me to draft any one of these sections in full LaTeX?
+
+✻ Crunched for 1m 12s
+
+❯ /resume 
+  ⎿  Resume cancelled
+
+❯ The draft has been created in /logs/research_draft.tex. I want you to now     
+  read over run_grpo_dropout.py, and check that the python code implements the  
+  research plan faithfully. If not, then check where it diverges.               
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+● /logs/ not present. Searching for research draft.
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+● Need quick check of coconut.py for replay mechanics.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Audit complete. Comparing code against research_draft.tex.
+
+  Faithful matches
+
+  ┌────────────────┬───────────────────────────────────────────┬───────────┐
+  │ Draft section  │                Code locus                 │  Status   │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Eq 3.1 dropout │                                           │           │
+  │  rescale +     │ configure_dropout (404-416) sets          │ ✓         │
+  │ per-step       │ attention/hidden/embd/resid_pdrop         │           │
+  │ Bernoulli      │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ K independent  │ for rollout_start in range(...,           │           │
+  │ masks per      │ rollout_chunk_size) (828) — fresh         │ ✓         │
+  │ group          │ capture_rng_state per chunk               │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Mask storage   │                                           │           │
+  │ via RNG seed   │ capture_rng_state / restore_rng_state     │ ✓         │
+  │ (Sec 6         │ (58-68); never stores full mask           │           │
+  │ "recommended") │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Eq 4.7 clipped │ t1, t2, -min(t1,t2) (1053-1055)           │ ✓         │
+  │  surrogate     │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Eq 1.1 group-n │ compute_group_advantages (394-401),       │           │
+  │ ormalized      │ unbiased=False matches biased σ in draft  │ ✓         │
+  │ advantage      │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ §3 (iii) CRN   │ restore_rng_state(all_rollout_rng_states[ │           │
+  │ replay at      │ ...]) before policy fwd (1018-1022)       │ ✓         │
+  │ update         │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Lemma 4.2      │ _replay_generate_batched chains           │           │
+  │ (autograd      │ last_embed through _forward_base w/o      │ ✓         │
+  │ through latent │ no_grad during update (coconut.py         │           │
+  │  recurrence)   │ 152-185)                                  │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Sec 6          │                                           │ ✓ (consis │
+  │ train/deploy   │ run_validation uses model.eval() (337) —  │ tent w/   │
+  │ mismatch       │ accepts O(p√d) bias                       │ caveat)   │
+  │ (option b)     │                                           │           │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Empirical CRN  │ assert_rollout_replay_embeddings_match    │ ✓ goes    │
+  │ check          │ (71-100) — verifies replay embeds =       │ beyond    │
+  │                │ rollout embeds bit-exact                  │ draft     │
+  ├────────────────┼───────────────────────────────────────────┼───────────┤
+  │ Constraint     │ rollout_chunk_size ==                     │           │
+  │ enforcing      │ policy_minibatch_size assertion (813-820) │ ✓         │
+  │ replay         │  — required because rng_state index =     │           │
+  │ structure      │ mb_start // rollout_chunk_size            │           │
+  └────────────────┴───────────────────────────────────────────┴───────────┘
+
+  Divergences
+
+  D1. Ref model conflates θ_old (ratio denom) and π_ref (KL anchor) — 
+  significant
+
+  Draft eq 4.7 has two distinct frozen models:
+  - ρ_θ = π_θ / π_{θ_old} where θ_old = rollout-time policy
+  - KL(π_θ ‖ π_ref) where π_ref = separate anchor (e.g., SFT init)
+
+  Code uses single ref_model for both, refreshed every ref_model_renewal_steps
+  (768-778). Consequences:
+  - Theorem 4.4 ("ρ_{θ_old} ≡ 1 at update start") no longer holds: ratio denom
+  is N-steps-stale snapshot, not start-of-step θ.
+  - KL anchor drifts toward current policy → KL regularization weakens over
+  training.
+  - Single mini-epoch (E=1) means clip is mostly cosmetic only when refresh=1;
+  with larger refresh, this becomes off-policy PPO without proper θ_old logging.
+
+  Fix options: (a) log pi_θ_old snapshot at rollout time (cache mb_ref_lp from
+  rollout-time forward), keep separate frozen pi_ref; (b) set
+  ref_model_renewal_steps=1 to recover on-policy ratio (loses KL anchor
+  entirely).
+
+  D2. Default reference_model_mode="deterministic" breaks CRN premise — 
+  significant
+
+  Lines 443, 960-965: default puts ref_model.eval() → dropout OFF when computing
+   mb_ref_lp. Then ratio is
+
+  ρ = π_θ(y | x, ξ) / π_ref(y | x, no dropout)
+
+  Two different conditional distributions. Violates draft eq 4.6 which assumes
+  same ξ in numerator and denominator. CRN coupling (Prop 4.5) does not apply to
+   this ratio.
+
+  Code DOES expose reference_model_mode="dropout_matched" (960-961, 969-970)
+  which restores rollout rng_state on ref forward — this branch IS faithful to
+  draft. But it's opt-in.
+
+  Fix: switch default to dropout_matched, or document that deterministic mode is
+   off-spec.
+
+  D3. KL estimator computes wrong distribution under D2
+
+  mb_kl = mb_ratio - log_ratio - 1 (1056) is k3 estimator of KL(p‖q) where
+  p=π_θ(·|x,ξ), q=π_ref(·|x,ξ_ref). When ξ_ref ≠ ξ (default deterministic mode),
+   this is not KL on the augmented policy Π_θ — biases regularizer. Theorem 4.4
+  corollary ("KL on augmented") fails.
+
+  D4. Hard clamp log_ratio.clamp(-5, 5) (1045) — undocumented
+
+  Draft §6 mentions ratio explosion as caveat but doesn't formalize defense.
+  Code adds aggressive exp(±5) = [0.0067, 148] clamp before PPO ε-clip. Fine in
+  practice, just absent from theory writeup.
+
+  D5. <|end-latent|> included in policy log-prob — minor
+
+  compute_log_probs (276-301) uses response_start = prompt_len + num_latents →
+  first token graded is <|end-latent|> (since latents occupy positions
+  prompt_len ... prompt_len+num_latents-1). Draft eq 2.6 grades only y_1...y_L
+  (post-latent answer tokens). Code grades <|end-latent|> + answer tokens.
+  Defensible — <|end-latent|> IS sampled, not deterministic — but worth noting
+  in writeup as part of "answer phase".
+
+  D6. Format penalty / length penalty extend draft reward — minor
+
+  Draft says r ∈ [0,1]. Code: format_penalty=-0.5,
+  length_penalty_per_token=0.01·max(0, n_lat-1). Doesn't break theory (A still
+  well-defined for arbitrary scalar r) but drifts from clean r ∈ [0,1] setup.
+
+  D7. Single mini-epoch (E=1) — minor
+
+  Draft Algorithm 1.c specifies "mini-epoch e=1,…,E". Code does single pass over
+   policy_mb_size chunks. With D1 (stale ref), this means ratio at start of step
+   is ≠ 1, but only one update is taken before next rollout. Consistent with
+  practical GRPO; just diverges from draft's E loop.
+
+  D8. configure_dropout coverage — verify
+
+  Lines 405-415 set 8 attribute names. Some Transformers (e.g., GPT-NeoX, modern
+   LLaMA configs) may use other names (mlp_dropout, hidden_act_dropout, etc.).
+  Worth grep on the actual model_config post-load to confirm dropout is non-zero
+   everywhere expected.
+
+  Summary recommendation
+
+  Two real divergences worth fixing or documenting:
+
+  1. Ref-model role conflation (D1) — break ref into theta_old (logged at
+  rollout, used for ratio) and pi_ref (frozen SFT, used for KL). This restores
+  Theorem 4.4 ρ≡1 condition.
+  2. Default ref mode (D2/D3) — flip default to dropout_matched, otherwise the
+  CRN proof (Prop 4.5) does not describe the running code.
+
+  Everything else is faithful or minor. The empirical embed-match assertion
+  (assert_rollout_replay_embeddings_match) is a strong sanity check that the
+  latent trajectory replay is bit-exact — confirms Lemma 4.2 implementation
+  works as intended.
+
+  Want me to draft fixes for D1 / D2?
+
+✻ Worked for 2m 46s
+
+❯ Create another file with the draft edits, called run_grpo_dropout_proof.py    
+
+● Copying base file then applying targeted edits.
+
+● Bash(cp /workspace/projects/260105_custom_LLM/260116_latent_space_LLM/coconut_
+      dropout/run_grpo_dropout.py
+      /workspace/projects/260105_custom_LLM/260116_latent_space_L…)
+  ⎿  1189 /workspace/projects/260105_custom_LLM/260116_latent_space_LLM/coc
+     onut_dropout/run_grpo_dropout_proof.py
+
+● Edit 1: header docstring documenting the proof-faithful changes.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  File must be read first
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 11 lines
+       1  # Copyright (c) Meta Platforms, Inc. and affiliates.
+       2  # All rights reserved.
+       3 +#                                                              
+       4 +# Proof-faithful variant of run_grpo_dropout.py.               
+       5 +# Differences vs. the base script (mapped to research_draft.tex
+         +):                                                             
+       6 +#   D1: separate theta_old (ratio denominator, captured at roll
+         +out time)                                                      
+       7 +#       from pi_ref (KL anchor, frozen ref_model). Restores The
+         +orem 4.4                                                       
+       8 +#       condition rho_{theta_old} == 1 at update start.        
+       9 +#   D2: default reference_model_mode = "dropout_matched". Resto
+         +res CRN                                                        
+      10 +#       coupling between rollout and reference forward (Prop 4.
+         +5).                                                            
+      11 +#   D3: KL is computed against pi_ref via a separate log-ratio 
+         +variable,                                                      
+      12 +#       so KL on the augmented policy is well-defined regardles
+         +s of                                                           
+      13 +#       theta_old drift.                                       
+      14  
+      15  import os
+      16  import sys
+
+● Edit 2: flip default reference_model_mode to "dropout_matched" (D2).
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 3 lines, removed 1 line
+      451      set_seed(configs.seed)
+      452      configs.__dict__["start_time"] = current_time
+      453      save_dir = os.path.join(configs.save_path, configs.name, c
+           urrent_time)
+      454 -    reference_model_mode = getattr(configs, "reference_model_m
+          -ode", "deterministic")                                        
+      454 +    # D2: default to "dropout_matched" so KL anchor is evaluat
+          +ed under the                                                  
+      455 +    # same dropout mask as rollout (CRN coupling assumed in Pr
+          +op 4.5).                                                      
+      456 +    reference_model_mode = getattr(configs, "reference_model_m
+          +ode", "dropout_matched")                                      
+      457      ref_model_device_name = getattr(configs, "ref_model_device
+           ", "cuda").lower()
+      458  
+      459      if ref_model_device_name not in {"cuda", "cpu"}:
+
+● Edit 3: capture rollout-time theta_old_lp per chunk. Initialize storage and
+  add forward pass under same RNG.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 5 lines
+      796                  all_prompt_ids = []
+      797                  all_prompt_masks = []
+      798                  all_rollout_rng_states = []
+      799 +                # D1: log-prob of generated tokens under the r
+          +ollout-time                                                   
+      800 +                # policy (theta_old) with the same dropout mas
+          +k. Used as the                                                
+      801 +                # PPO ratio denominator at update time.       
+      802 +                all_theta_old_lp = []                         
+      803 +                all_theta_old_mask = []                       
+      804                  all_correct = 0
+      805                  all_total = 0
+      806                  n_latents_correct_sum = 0
+● Edit 4: insert theta_old forward pass per rollout chunk. Reuses
+  verify_replay_embeddings path since it already replays under restored RNG.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 27 lines
+      882                                  synced_gpus=True,
+      883                              )
+      884  
+      885 +                        # D1: capture theta_old log-prob of th
+          +e actually-generated                                          
+      886 +                        # tokens, evaluated under the SAME dro
+          +pout mask that                                                
+      887 +                        # produced them (RNG restored). This i
+          +s the rollout-time                                            
+      888 +                        # policy snapshot; it serves as the PP
+          +O ratio denominator                                           
+      889 +                        # at update time, restoring rho_{theta
+          +_old} == 1 at step                                            
+      890 +                        # start (Theorem 4.4).                
+      891 +                        was_training = parallel_model.module.t
+          +raining                                                       
+      892 +                        parallel_model.module.train()         
+      893 +                        restore_rng_state(rng_state, device)  
+      894 +                        theta_old_outputs = parallel_model.mod
+          +ule(                                                          
+      895 +                            input_ids=prompt_chunk,           
+      896 +                            attention_mask=attn_chunk,        
+      897 +                            replay_generated_ids=generated,   
+      898 +                        )                                     
+      899 +                        theta_old_lp_chunk, theta_old_mask_chu
+          +nk = compute_log_probs(                                       
+      900 +                            generated,                        
+      901 +                            theta_old_outputs,                
+      902 +                            prompt_len,                       
+      903 +                            num_latents,                      
+      904 +                            tokenizer.eos_token_id,           
+      905 +                        )                                     
+      906 +                        all_theta_old_lp.append(theta_old_lp_c
+          +hunk.detach().cpu())                                          
+      907 +                        all_theta_old_mask.append(theta_old_ma
+          +sk_chunk.detach().cpu())                                      
+      908 +                        if not was_training:                  
+      909 +                            parallel_model.module.eval()      
+      910 +                        del theta_old_outputs, theta_old_lp_ch
+          +unk, theta_old_mask_chunk                                     
+      911 +                                                              
+      912                          rewards, base_rewards, _, _, accuracie
+           s, _, n_latents_correct = compute_reward(
+      913                              generated,
+      914                              tokenizer,
+
+● Reconsidering — better to do theta_old replay post-rollout, mirroring ref
+  replay loop. Reverting in-rollout edit.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Removed 27 lines
+      882                                  synced_gpus=True,
+      883                              )
+      884  
+      885 -                        # D1: capture theta_old log-prob of th
+          -e actually-generated                                          
+      886 -                        # tokens, evaluated under the SAME dro
+          -pout mask that                                                
+      887 -                        # produced them (RNG restored). This i
+          -s the rollout-time                                            
+      888 -                        # policy snapshot; it serves as the PP
+          -O ratio denominator                                           
+      889 -                        # at update time, restoring rho_{theta
+          -_old} == 1 at step                                            
+      890 -                        # start (Theorem 4.4).                
+      891 -                        was_training = parallel_model.module.t
+          -raining                                                       
+      892 -                        parallel_model.module.train()         
+      893 -                        restore_rng_state(rng_state, device)  
+      894 -                        theta_old_outputs = parallel_model.mod
+          -ule(                                                          
+      895 -                            input_ids=prompt_chunk,           
+      896 -                            attention_mask=attn_chunk,        
+      897 -                            replay_generated_ids=generated,   
+      898 -                        )                                     
+      899 -                        theta_old_lp_chunk, theta_old_mask_chu
+          -nk = compute_log_probs(                                       
+      900 -                            generated,                        
+      901 -                            theta_old_outputs,                
+      902 -                            prompt_len,                       
+      903 -                            num_latents,                      
+      904 -                            tokenizer.eos_token_id,           
+      905 -                        )                                     
+      906 -                        all_theta_old_lp.append(theta_old_lp_c
+          -hunk.detach().cpu())                                          
+      907 -                        all_theta_old_mask.append(theta_old_ma
+          -sk_chunk.detach().cpu())                                      
+      908 -                        if not was_training:                  
+      909 -                            parallel_model.module.eval()      
+      910 -                        del theta_old_outputs, theta_old_lp_ch
+          -unk, theta_old_mask_chunk                                     
+      911 -                                                              
+      885                          rewards, base_rewards, _, _, accuracie
+           s, _, n_latents_correct = compute_reward(
+      886                              generated,
+      887                              tokenizer,
+
+● Now insert post-rollout theta_old replay block. Mirrors the ref replay loop
+  but uses parallel_model.module (no_grad, train mode, RNG-replayed).
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 41 lines
+       970                  reward_tensor = torch.tensor(all_rewards, dev
+            ice=device, dtype=torch.float32)
+       971                  advantages = compute_group_advantages(reward_
+            tensor, configs.num_rollouts)
+       972  
+       973 +                # Theta_old Replay ##########################
+           +#############################################################
+           +########################                                     
+       974 +                # D1: replay generated tokens through current
+           + parallel_model                                              
+       975 +                # (still at theta_old: no optimizer.step yet)
+           + under matched                                               
+       976 +                # dropout RNG. Yields log p_{theta_old}(y | x
+           +, xi) for the                                                
+       977 +                # PPO ratio denominator. Chunk granularity mu
+           +st equal the                                                 
+       978 +                # rollout granularity so rng_state index alig
+           +ns.                                                          
+       979 +                                                             
+       980 +                with torch.no_grad():                        
+       981 +                    theta_old_lp_chunks = []                 
+       982 +                    theta_old_mask_chunks = []               
+       983 +                    was_training = parallel_model.module.trai
+           +ning                                                         
+       984 +                    parallel_model.module.train()            
+       985 +                    for mb_start in range(0, token_ids.shape[
+           +0], rollout_chunk_size):                                     
+       986 +                        mb_end = min(mb_start + rollout_chunk
+           +_size, token_ids.shape[0])                                   
+       987 +                        restore_rng_state(                   
+       988 +                            all_rollout_rng_states[mb_start /
+           +/ rollout_chunk_size],                                       
+       989 +                            device,                          
+       990 +                        )                                    
+       991 +                        old_outputs = parallel_model.module( 
+       992 +                            input_ids=prompt_ids_cpu[mb_start
+           +:mb_end],                                                    
+       993 +                            attention_mask=prompt_masks_cpu[m
+           +b_start:mb_end],                                             
+       994 +                            replay_generated_ids=token_ids[mb
+           +_start:mb_end],                                              
+       995 +                        )                                    
+       996 +                        old_lp_chunk, old_mask_chunk = comput
+           +e_log_probs(                                                 
+       997 +                            token_ids[mb_start:mb_end],      
+       998 +                            old_outputs,                     
+       999 +                            prompt_len,                      
+      1000 +                            num_latents,                     
+      1001 +                            tokenizer.eos_token_id,          
+      1002 +                        )                                    
+      1003 +                        theta_old_lp_chunks.append(old_lp_chu
+           +nk.detach())                                                 
+      1004 +                        theta_old_mask_chunks.append(old_mask
+           +_chunk.detach())                                             
+      1005 +                        del old_outputs, old_lp_chunk, old_ma
+           +sk_chunk                                                     
+      1006 +                                                             
+      1007 +                    theta_old_lp = torch.cat(theta_old_lp_chu
+           +nks, dim=0)                                                  
+      1008 +                    theta_old_loss_mask = torch.cat(theta_old
+           +_mask_chunks, dim=0)                                         
+      1009 +                    if not was_training:                     
+      1010 +                        parallel_model.module.eval()         
+      1011 +                                                             
+      1012 +                measure_timer("Theta_old replay")            
+      1013 +                                                             
+      1014                  # Reference Replay ##########################
+            #############################################################
+            ########################
+      1015  
+      1016                  with torch.no_grad():
+
+● Removing now-unused init lists.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Removed 5 lines
+      796                  all_prompt_ids = []
+      797                  all_prompt_masks = []
+      798                  all_rollout_rng_states = []
+      799 -                # D1: log-prob of generated tokens under the r
+          -ollout-time                                                   
+      800 -                # policy (theta_old) with the same dropout mas
+          -k. Used as the                                                
+      801 -                # PPO ratio denominator at update time.       
+      802 -                all_theta_old_lp = []                         
+      803 -                all_theta_old_mask = []                       
+      799                  all_correct = 0
+      800                  all_total = 0
+      801                  n_latents_correct_sum = 0
+
+● Edit 5: rewrite policy update — split log-ratios for ratio (vs θ_old) and KL
+  (vs π_ref).
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 21 lines, removed 4 lines
+      1062                  total_rollouts = token_ids.shape[0]
+      1063                  total_nonmasked = ref_loss_mask.sum().clamp(m
+            in=1)
+      1064                  max_log_ratio = torch.tensor(0.0, device=devi
+            ce)
+      1065 +                max_log_ratio_ref = torch.tensor(0.0, device=
+           +device)                                                      
+      1066                  step_loss = 0.0
+      1067  
+      1068                  optimizer.zero_grad()
+     ...
+      1080                      mb_mask = prompt_masks_cpu[mb_start:mb_en
+            d]
+      1081                      mb_tok = token_ids[mb_start:mb_end]
+      1082                      mb_adv = advantages[mb_start:mb_end]
+      1083 +                    # D1: theta_old log-prob = ratio denomina
+           +tor.                                                         
+      1084 +                    mb_old_lp = theta_old_lp[mb_start:mb_end]
+      1085 +                    # D3: ref log-prob used only for the KL a
+           +nchor.                                                       
+      1086                      mb_ref_lp = ref_lp_per_token[mb_start:mb_
+            end]
+      1087                      mb_ref_mask = ref_loss_mask[mb_start:mb_e
+            nd]
+      1088  
+     ...
+      1099                          tokenizer.eos_token_id,
+      1100                      )
+      1101  
+      1098 -                    mb_log_ratio = mb_new_lp - mb_ref_lp     
+      1102 +                    # PPO clip on rho = pi_theta / pi_{theta_
+           +old} (eq 4.6).                                               
+      1103 +                    mb_log_ratio = mb_new_lp - mb_old_lp     
+      1104                      mb_log_ratio_clamped = mb_log_ratio.clamp
+            (-5, 5)
+      1105                      mb_ratio = torch.exp(mb_log_ratio_clamped
+            )
+      1106                      mb_clipped = torch.clamp(
+     ...
+      1112                      t1 = mb_ratio * mb_adv.unsqueeze(-1)
+      1113                      t2 = mb_clipped * mb_adv.unsqueeze(-1)
+      1114                      mb_policy_loss = -torch.min(t1, t2)
+      1110 -                    mb_kl = mb_ratio - mb_log_ratio_clamped -
+           - 1.0                                                         
+      1115 +                                                             
+      1116 +                    # k3 KL estimator against pi_ref (eq 4.7 
+           +KL term).                                                    
+      1117 +                    mb_log_ratio_ref = mb_new_lp - mb_ref_lp 
+      1118 +                    mb_log_ratio_ref_clamped = mb_log_ratio_r
+           +ef.clamp(-5, 5)                                              
+      1119 +                    mb_ratio_ref = torch.exp(mb_log_ratio_ref
+           +_clamped)                                                    
+      1120 +                    mb_kl = mb_ratio_ref - mb_log_ratio_ref_c
+           +lamped - 1.0                                                 
+      1121 +                                                             
+      1122                      mb_total_loss = mb_policy_loss + configs.
+            kl_beta * mb_kl
+      1123                      mb_loss = (mb_total_loss * mb_ref_mask).s
+            um() / total_nonmasked
+      1124  
+     ...
+      1129                              max_log_ratio,
+      1130                              mb_log_ratio.detach().abs().max()
+            ,
+      1131                          )
+      1132 +                        max_log_ratio_ref = torch.max(       
+      1133 +                            max_log_ratio_ref,               
+      1134 +                            mb_log_ratio_ref.detach().abs().m
+           +ax(),                                                        
+      1135 +                        )                                    
+      1136                      del mb_new_outputs, mb_new_lp, mb_log_rat
+            io, mb_log_ratio_clamped
+      1122 -                    del mb_ratio, mb_clipped, t1, t2, mb_poli
+           -cy_loss, mb_kl, mb_total_loss, mb_loss                       
+      1123 -                    del mb_prompt, mb_mask, mb_tok, mb_adv, m
+           -b_ref_lp, mb_ref_mask                                        
+      1137 +                    del mb_ratio, mb_clipped, t1, t2, mb_poli
+           +cy_loss                                                      
+      1138 +                    del mb_log_ratio_ref, mb_log_ratio_ref_cl
+           +amped, mb_ratio_ref, mb_kl                                   
+      1139 +                    del mb_total_loss, mb_loss               
+      1140 +                    del mb_prompt, mb_mask, mb_tok, mb_adv, m
+           +b_old_lp, mb_ref_lp, mb_ref_mask                             
+      1141  
+      1142                  measure_timer("Policy replay")
+      1143  
+
+● Edit 6: log new ratio metric, plus update wandb payload to include ref-side
+  ratio.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 1 line
+      1151                              "train/loss": step_loss,
+      1152                              "train/learning_rate": optimizer.
+            param_groups[0]["lr"],
+      1153                              "train/max_log_ratio": max_log_ra
+            tio.item(),
+      1154 +                            "train/max_log_ratio_ref": max_lo
+           +g_ratio_ref.item(),                                          
+      1155                              "train/zero_reward_frac": sum(1 f
+            or r in all_rewards if r <= 0) / max(len(all_rewards), 1),
+      1156                          }
+      1157                      )
+● Edit 7: cleanup block — del new tensors at end of step.
+
+● Update(run_grpo_dropout_proof.py)
+  ⎿  Added 2 lines
+      1165  
+      1166                  del token_ids, prompt_ids_cpu, prompt_masks_c
+            pu, reward_tensor, advantages
+      1167                  del generated_all, padded_token_ids, ref_lp_p
+            er_token, ref_loss_mask
+      1168 +                del theta_old_lp, theta_old_loss_mask        
+      1169 +                del theta_old_lp_chunks, theta_old_mask_chunk
+           +s                                                            
+      1170                  del all_token_ids, all_prompt_ids, all_prompt
+            _masks, all_rollout_rng_states
+      1171                  del repeated_input_ids, repeated_attention_ma
+            sk
+      1172                  del ref_lp_chunks, ref_mask_chunks
+
+● Bash(cd /workspace/projects/260105_custom_LLM/260116_latent_space_LLM/coconut_
+      dropout && python -m py_compile run_grpo_dropout_proof.py && echo OK)
+  ⎿  Error: Exit code 127
+     /bin/bash: line 1: python: command not found
+
+● Bash(cd /workspace/projects/260105_custom_LLM/260116_latent_space_LLM/coconut_
+      dropout && (command -v python3 && python3 -m py_compile
+      run_grpo_dropout_proof.py && ec…)
+  ⎿  /usr/bin/python3
+     OK
+
+● Parses clean.
+
+● Sanity-check the final file structure.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Done. Summary of changes in run_grpo_dropout_proof.py:
+
+  ┌─────┬───────────┬────────────────────────────────────────────────────────┐
+  │  #  │   Lines   │                         Change                         │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │ 1   │ 4-13      │ Header docstring documenting D1/D2/D3                  │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │ 2   │ 454-456   │ Default reference_model_mode = "dropout_matched" (D2)  │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │     │           │ New Theta_old Replay block — parallel_model.module     │
+  │ 3   │ 967-1006  │ forward in train mode + no_grad + restored RNG, yields │
+  │     │           │  theta_old_lp per generated token (D1)                 │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │     │           │ Policy update split: mb_log_ratio = mb_new_lp -        │
+  │ 4   │ 1080-1115 │ mb_old_lp for PPO clip; separate mb_log_ratio_ref =    │
+  │     │           │ mb_new_lp - mb_ref_lp feeds k3 KL term (D1+D3)         │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │ 5   │ 1141-1146 │ New train/max_log_ratio_ref wandb metric               │
+  ├─────┼───────────┼────────────────────────────────────────────────────────┤
+  │ 6   │ 1167-1169 │ Cleanup del for new tensors                            │
+  └─────┴───────────┴────────────────────────────────────────────────────────┘
+
+  Key behavioral consequences:
+
+  - At step start, mb_new_lp == mb_old_lp (identical params, identical RNG,
+  replay verified bit-exact) → ratio ≡ 1 → Theorem 4.4 condition holds.
+  - KL anchor pi_ref is the periodically-refreshed ref_model. To get a truly
+  frozen SFT anchor (DeepSeekMath-style), set ref_model_renewal_steps to a huge
+  value in config.
+  - dropout_matched ref forward + new theta_old forward both restore rollout RNG
+   → CRN coupling preserved end-to-end (Prop 4.5).
+
+  py_compile clean. No runtime test on GPU yet — recommend smoke-running with
+  debug=true in the YAML before a real run.
+
+✻ Worked for 4m 42s
+
+※ recap: Goal: build proof-faithful GRPO-with-dropout trainer for Coconut latent reasoning. Created run_grpo_dropout_proof.py with theta_old/pi_ref split, dropout_matched default, and separate KL log-ratio. Next: smoke-run with debug=true config on GPU before real training. (disable recaps in /config)
+
+❯ So instead of the KL divergence being checked against the reference model,    
+  it's checked against the policy model's generations before the gradient       
+  updates happens. By clipping to the policy model before the update, we        
+  prevent the model from diverging too far from what it should have generated?  
+
+● Not quite — two separate mechanisms, two separate anchors. Let me untangle.
+
+  Two anchors, two roles
+
+  PPO ratio (clip term) — denom = θ_old (policy just before this step's gradient
+   update):
+
+  $$\rho = \frac{\pi_\theta}{\pi_{\theta_\text{old}}}, \qquad \text{clip}(\rho,
+  1-\varepsilon, 1+\varepsilon)$$
+
+  Purpose: trust region on a single update step. Bounds how far one gradient
+  step can move the policy distribution. Local.
+
+  KL term — anchor = π_ref (frozen reference, e.g. SFT init), unchanged from
+  base code:
+
+  $$\beta \cdot \text{KL}(\pi_\theta ,|, \pi_\text{ref})$$
+
+  Purpose: prevents cumulative drift over the entire training run away from the
+  well-behaved SFT model. Global.
+
+  Mapping to the code
+
+  ┌─────────────────────┬───────────────┬───────────────────────────┬───────┐
+  │        Term         │   Numerator   │        Denominator        │ Lines │
+  ├─────────────────────┼───────────────┼───────────────────────────┼───────┤
+  │ mb_log_ratio (PPO   │ new pi_θ      │ θ_old (rollout-time,      │ 1101  │
+  │ clip)               │ log-prob      │ fresh each step)          │       │
+  ├─────────────────────┼───────────────┼───────────────────────────┼───────┤
+  │ mb_log_ratio_ref    │ new pi_θ      │ π_ref (frozen,            │ 1110  │
+  │ (KL)                │ log-prob      │ refresh-able)             │       │
+  └─────────────────────┴───────────────┴───────────────────────────┴───────┘
+
+  Both ratios share the same numerator (mb_new_lp). Different denominators.
+
+  Why this fixes the original
+
+  Original code: mb_ref_lp was used for both ratio denom AND KL anchor → ratio
+  was vs. an N-step-stale snapshot, not vs. θ_old. Theorem 4.4's "ρ ≡ 1 at step
+  start" failed.
+
+  Fix: capture θ_old log-probs fresh at every rollout (matched dropout RNG) → ρ
+  ≡ 1 at step start → clip is a true per-step trust region. KL still anchors to
+  π_ref, just like DeepSeekMath / standard GRPO.
+
+  Restating your sentence corrected
+
+  ▎ "By clipping to the policy model before the update, we prevent the model 
+  ▎ from diverging too far from what it should have generated"
+
+  Replace "diverging" with "stepping". Clip prevents the one gradient step from
+  moving π_θ too far from π_{θ_old}. KL (separate term) prevents cumulative 
+  training from moving π_θ too far from π_ref. Different time scales, different
+  anchors.

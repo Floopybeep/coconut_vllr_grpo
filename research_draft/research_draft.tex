@@ -1,0 +1,552 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\TV}{\mathrm{TV}}
+\newcommand{\D}{\mathcal{D}}
+\newcommand{\Loss}{\mathcal{L}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\old}{\mathrm{old}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+
+\title{Dropout-Induced Stochasticity for GRPO Fine-Tuning of \\
+       Latent-Reasoning Language Models}
+\author{Wooil Jung}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Latent-reasoning language models such as \textsc{Coconut} (Hao et al., 2024)
+replace discrete chain-of-thought tokens with continuous hidden states fed
+recurrently into the next reasoning step.  Because the latent recurrence is
+deterministic given the input, na\"ive policy-gradient methods such as GRPO
+cannot generate diverse rollouts in latent space, which removes the variance
+that group-relative advantage estimation relies on.  We propose to use a small
+dropout rate $p \approx 0.1$ as the source of stochasticity during rollout, and
+to \emph{replay the same dropout mask} during the policy update so that the
+latent trajectory observed at rollout time is reproduced exactly.  We show
+that, under this construction, dropout noise plays the role of an
+\emph{exogenous} reparameterization variable, the per-mask GRPO surrogate is an
+unbiased estimator of the policy gradient of an augmented (mask-marginalized)
+policy, and replaying the mask provides common-random-numbers variance
+reduction over the alternative of resampling at update time.  We also give an
+inductive argument that the surrogate gradient is well defined at every latent
+depth $T$, and we relate the construction to the MC-dropout Bayesian
+interpretation of dropout.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction and motivation}
+% =====================================================================
+
+Group Relative Policy Optimization (GRPO; Shao et al., 2024) has become the
+standard reinforcement-learning objective for fine-tuning reasoning LLMs on
+math benchmarks.  Its appeal is that the per-prompt advantage is computed
+purely from a group of $K$ rollouts and a verifier reward, with no learned
+critic.  GRPO requires that the $K$ rollouts \emph{differ}, because the
+group-normalized advantage,
+\begin{equation}
+A^{(k)} \;=\; \frac{r^{(k)} - \mu_r}{\sigma_r + \delta},
+\qquad
+\mu_r = \tfrac1K\sum_{k=1}^{K} r^{(k)},
+\qquad
+\sigma_r^2 = \tfrac1K\sum_{k=1}^{K}(r^{(k)} - \mu_r)^2,
+\label{eq:grpo-advantage}
+\end{equation}
+is identically zero whenever all rollouts agree.  In a standard token-level
+LLM, diversity is supplied automatically by sampling from the next-token
+distribution.
+
+\textsc{Coconut}-style latent reasoning, by contrast, does not sample.  Hidden
+states $h_t \in \R^d$ are fed back into the model as the embedding of the next
+``token'' for $t = 1, \dots, T$ until a stopping criterion fires; only after
+the latent phase ends does the model emit discrete answer tokens
+$y_1, \dots, y_L$.  Conditional on the prompt $x$, the latent phase is a
+\emph{deterministic} function of the parameters $\theta$.  This breaks GRPO:
+all $K$ rollouts share the same $h_T$ and (for greedy decoding) the same $y$.
+
+We propose to inject stochasticity by enabling dropout during rollout.  This
+yields per-rollout latent trajectories that depend on a Bernoulli mask
+$\xi \sim p(\xi)$ which is independent of $\theta$, so GRPO can grade rollouts
+relative to one another.  At update time we re-mount the \emph{same} mask so
+that the gradient is computed against the trajectory that was actually graded.
+The rest of this note formalizes the construction and proves the basic
+correctness and variance properties.
+
+% =====================================================================
+\section{Preliminaries}
+% =====================================================================
+
+\subsection{Coconut recurrence with dropout}
+\label{sec:coconut-recurrence}
+
+Let $f_\theta : \R^d \to \R^d$ denote one Transformer step of the
+latent-reasoning model with parameters $\theta \in \R^D$.  Standard
+\textsc{Coconut} unrolls
+\begin{equation}
+h_t \;=\; f_\theta(h_{t-1}),
+\qquad
+h_0 \;=\; \mathrm{embed}_\theta(x),
+\qquad t = 1,\dots,T.
+\end{equation}
+With dropout at rate $p$ and keep-probability $q := 1-p$, define a Bernoulli
+mask $m_t \in \{0,1\}^D$ with $m_t \sim \mathrm{Bern}(q)^{\otimes D}$ and the
+rescaled per-step parameters
+\begin{equation}
+\tilde\theta_t(\xi_t) \;:=\; \theta \odot m_t / q,
+\qquad
+\E_{\xi_t}\!\big[m_t/q\big] = \mathbf 1.
+\label{eq:dropout-rescale}
+\end{equation}
+The dropout-perturbed recurrence is
+\begin{equation}
+h_t \;=\; f_{\tilde\theta_t(\xi_t)}(h_{t-1}),
+\qquad
+\xi := (\xi_1, \dots, \xi_T) \sim p(\xi) = \prod_{t=1}^T p(\xi_t).
+\label{eq:dropout-recurrence}
+\end{equation}
+Once the latent phase finishes, answer tokens are sampled autoregressively,
+\begin{equation}
+y_\ell \;\sim\; \pi_\theta(\cdot \mid x, h_T, y_{<\ell}),
+\qquad \ell = 1, \dots, L,
+\end{equation}
+optionally with dropout enabled here as well; we absorb any such sampling
+randomness into $\xi$ by reparameterizing the categorical samples with
+Gumbel noise when convenient.  A scalar reward $r(y, x) \in [0,1]$ is provided
+by an external verifier (e.g.\ exact-match on \textsc{GSM8K}).
+
+\subsection{Augmented policy}
+The induced distribution over $(\xi, y)$ given $x$ is
+\begin{equation}
+\Pi_\theta(\xi, y \mid x)
+   \;=\; p(\xi) \, \pi_\theta(y \mid x, \xi),
+\qquad
+\pi_\theta(y \mid x, \xi)
+  := \prod_{\ell=1}^{L} \pi_\theta\!\big(y_\ell \,\big|\, x, h_T(\theta,\xi,x), y_{<\ell}\big).
+\label{eq:augmented-policy}
+\end{equation}
+We treat $\Pi_\theta$ as the policy that GRPO optimizes; the dropout mask is
+part of the action.  The marginal policy
+\begin{equation}
+\bar\pi_\theta(y \mid x) \;:=\; \E_{\xi \sim p}\!\big[\pi_\theta(y \mid x, \xi)\big]
+\label{eq:marginal-policy}
+\end{equation}
+is the object whose expected reward we ultimately wish to maximize.
+
+\subsection{GRPO objective}
+
+For a group of $K$ rollouts $\{(\xi^{(k)}, y^{(k)})\}_{k=1}^K$ generated under
+parameters $\theta_\old$, with rewards $r^{(k)} = r(y^{(k)}, x)$, define
+advantages $A^{(k)}$ via~\eqref{eq:grpo-advantage} and the per-token
+importance ratio
+\begin{equation}
+\rho_\theta^{(k)}(\xi, y)
+  \;:=\;
+\frac{\pi_\theta(y \mid x, \xi)}{\pi_{\theta_\old}(y \mid x, \xi)}.
+\end{equation}
+The clipped GRPO surrogate is
+\begin{equation}
+\Loss^{\mathrm{GRPO}}(\theta)
+  \;=\;
+\E_{x \sim \D}\,
+\frac{1}{K}\sum_{k=1}^{K}
+  \min\!\Big(
+    \rho_\theta^{(k)}\, A^{(k)}, \;
+    \mathrm{clip}(\rho_\theta^{(k)},\,1-\eps,\,1+\eps)\,A^{(k)}
+  \Big)
+  \;-\;\beta\,\KL\!\big(\pi_{\theta}\,\big\|\,\pi_{\mathrm{ref}}\big).
+\label{eq:grpo-loss}
+\end{equation}
+
+% =====================================================================
+\section{Method: dropout as exogenous noise with mask replay}
+% =====================================================================
+
+The proposed procedure is:
+\begin{enumerate}[topsep=2pt,itemsep=2pt]
+\item For each prompt $x$, draw $K$ independent dropout masks
+      $\xi^{(1)}, \dots, \xi^{(K)} \sim p(\xi)$.
+\item For each $k$, run the latent-reasoning recurrence
+      \eqref{eq:dropout-recurrence} with mask $\xi^{(k)}$ \emph{stored on
+      device}, decode answer tokens $y^{(k)}$, compute reward $r^{(k)}$ and
+      advantage $A^{(k)}$ via~\eqref{eq:grpo-advantage}.
+\item During the policy update, recompute $\pi_\theta(y^{(k)}\mid x,\xi^{(k)})$
+      with the \emph{same} stored mask $\xi^{(k)}$, so that $h_T$ at update
+      time matches $h_T$ at rollout time exactly when $\theta = \theta_\old$.
+      Form the GRPO loss~\eqref{eq:grpo-loss} and step $\theta$.
+\end{enumerate}
+
+The construction rests on three observations.
+
+\paragraph{(i) Independence of $\xi$ from $\theta$.}
+The dropout mask $\xi$ is sampled from a fixed distribution $p(\xi)$ that does
+not depend on $\theta$.  Hence, in~\eqref{eq:augmented-policy},
+$\nabla_\theta \log p(\xi) = 0$, and
+\begin{equation}
+\nabla_\theta \log \Pi_\theta(\xi, y \mid x)
+  \;=\;
+\nabla_\theta \log \pi_\theta(y \mid x, \xi).
+\label{eq:score-reduces}
+\end{equation}
+The gradient signal therefore comes entirely from the $\xi$-conditional log
+likelihood of the answer tokens, which is differentiable through the
+unrolled latent path.
+
+\paragraph{(ii) Reparameterization view.}
+With $\xi$ fixed, $h_T = h_T(\theta, \xi, x)$ is a deterministic, almost
+everywhere differentiable function of $\theta$.  This is precisely the setting
+of the reparameterization trick (Kingma \& Welling, 2014).  Equivalently,
+sampling $\xi$ first and then computing $h_T$ is a coupling of stochastic
+processes across different $\theta$ values --- the common-random-numbers
+construction (Glasserman \& Yao, 1992).
+
+\paragraph{(iii) Mask replay = common random numbers.}
+At update time we evaluate $\pi_\theta$ on the same $\xi^{(k)}$ that was used
+at rollout time.  This couples the rollout-time and update-time trajectories
+so that the only source of difference between them is the parameter update
+$\theta - \theta_\old$ itself.  Without replay, the importance ratio
+$\rho_\theta(\xi, y) / \rho_\theta(\xi', y)$ would also reflect mask
+resampling, inflating its variance.
+
+% =====================================================================
+\section{Theoretical analysis}
+% =====================================================================
+
+\subsection{Well-definedness of the surrogate gradient (induction on $T$)}
+
+\begin{assumption}\label{ass:smooth}
+For every fixed mask $\xi$, the map $\theta \mapsto f_{\tilde\theta(\xi)}(h)$
+is differentiable in $\theta$ for almost every $h$, and the answer-token
+log-likelihood $\log \pi_\theta(y \mid x, h_T, y_{<\ell})$ is differentiable
+in both $\theta$ and $h_T$.
+\end{assumption}
+
+This is satisfied by every standard Transformer block: the dropout rescaling
+$\theta \odot m/q$ is linear in $\theta$, and the remaining nonlinearities
+(LayerNorm, GELU, softmax) are almost everywhere differentiable.
+
+\begin{lemma}[Well-defined latent gradient at depth $T$]
+\label{lem:induction}
+Under Assumption~\ref{ass:smooth}, for every $T \ge 0$ and almost every
+$\xi$, the Jacobian $\partial h_T / \partial \theta$ exists and is given by
+the recursion
+\begin{equation}
+\frac{\partial h_t}{\partial \theta}
+  \;=\;
+\frac{\partial f_{\tilde\theta_t}}{\partial \theta}\bigg|_{h_{t-1}}
+  \cdot
+\frac{\partial \tilde\theta_t}{\partial \theta}
+  \;+\;
+\frac{\partial f_{\tilde\theta_t}}{\partial h}\bigg|_{h_{t-1}}
+  \cdot
+\frac{\partial h_{t-1}}{\partial \theta},
+\qquad
+\frac{\partial h_0}{\partial \theta}
+  \;=\;
+\frac{\partial \,\mathrm{embed}_\theta(x)}{\partial \theta},
+\label{eq:latent-jacobian}
+\end{equation}
+where $\partial \tilde\theta_t / \partial \theta = \mathrm{diag}(m_t)/q$ is the
+dropout-rescaled identity.  Consequently
+$\nabla_\theta \log \pi_\theta(y \mid x, \xi)$ is well defined.
+\end{lemma}
+
+\begin{proof}
+By induction on $t$.
+
+\emph{Base case} ($t=0$).  $h_0 = \mathrm{embed}_\theta(x)$ is differentiable in
+$\theta$ by assumption, giving the stated initial Jacobian.
+
+\emph{Inductive step.}  Assume $\partial h_{t-1}/\partial \theta$ exists.
+Write $h_t = f(\tilde\theta_t, h_{t-1})$, viewing $f$ as a function of two
+arguments.  By the multivariate chain rule and Assumption~\ref{ass:smooth},
+\[
+\frac{\partial h_t}{\partial \theta}
+  \;=\;
+\frac{\partial f}{\partial \tilde\theta_t}
+  \cdot
+\frac{\partial \tilde\theta_t}{\partial \theta}
+  \;+\;
+\frac{\partial f}{\partial h_{t-1}}
+  \cdot
+\frac{\partial h_{t-1}}{\partial \theta},
+\]
+and $\partial \tilde\theta_t/\partial \theta = \mathrm{diag}(m_t)/q$ from
+\eqref{eq:dropout-rescale}.  Both terms exist (the second by the inductive
+hypothesis), giving~\eqref{eq:latent-jacobian}.
+
+Finally, since $\log \pi_\theta(y \mid x, h_T, y_{<\ell})$ is differentiable in
+both $\theta$ and $h_T$, one more chain-rule application yields
+$\nabla_\theta \log \pi_\theta(y \mid x, \xi)
+   = \sum_\ell [\partial_\theta \log \pi_\theta]_{\text{direct}}
+              + [\partial_{h_T}\log \pi_\theta]\cdot \partial h_T/\partial\theta$.
+\end{proof}
+
+\begin{remark}
+The recursion~\eqref{eq:latent-jacobian} is what \texttt{loss.backward()}
+implements when the dropout masks are stored and replayed: PyTorch's
+\texttt{torch.nn.functional.dropout} treats the rescaled mask as a constant
+during backprop, which is exactly $\partial \tilde\theta_t/\partial \theta =
+\mathrm{diag}(m_t)/q$.
+\end{remark}
+
+\subsection{Unbiasedness of the dropout-GRPO surrogate}
+
+\begin{theorem}[Unbiased policy gradient on the augmented policy]
+\label{thm:unbiased}
+Let $J(\theta) := \E_{x\sim\D}\,\E_{(\xi,y)\sim\Pi_\theta(\cdot\mid x)}[r(y,x)]$
+be the expected reward under the augmented policy~\eqref{eq:augmented-policy}.
+Then
+\begin{equation}
+\nabla_\theta \Loss^{\mathrm{GRPO}}(\theta)\Big|_{\theta=\theta_\old}
+  \;=\;
+\E_{x,\xi,y}\!\left[A(\xi, y)\,
+       \nabla_\theta \log \pi_\theta(y\mid x,\xi)\right]_{\theta_\old}
+  \;=\;
+\nabla_\theta J(\theta)\Big|_{\theta_\old},
+\label{eq:unbiased}
+\end{equation}
+provided the KL term in~\eqref{eq:grpo-loss} is evaluated as
+$\KL(\Pi_\theta \| \Pi_\mathrm{ref})$ on the augmented policy.
+\end{theorem}
+
+\begin{proof}
+At $\theta = \theta_\old$ we have $\rho_{\theta_\old} \equiv 1$, so the clip is
+inactive and the gradient of the $\min$ reduces to the gradient of the unclipped
+ratio:
+\[
+\nabla_\theta \rho_\theta\big|_{\theta_\old}
+   \;=\;
+\nabla_\theta \log \pi_\theta(y\mid x,\xi)\big|_{\theta_\old}.
+\]
+Therefore
+\begin{equation}
+\nabla_\theta \Loss^{\mathrm{GRPO}}\big|_{\theta_\old}
+  \;=\;
+\E_{x,\xi,y}\!\left[A(\xi,y)\,\nabla_\theta\log\pi_\theta(y\mid x,\xi)\right]_{\theta_\old}.
+\label{eq:proof-step1}
+\end{equation}
+By~\eqref{eq:score-reduces},
+$\nabla_\theta\log\pi_\theta(y\mid x,\xi)
+   = \nabla_\theta\log \Pi_\theta(\xi,y\mid x)$, so the right-hand side is the
+REINFORCE estimator on the augmented policy with advantage $A$.  The
+group-relative baseline $\mu_r$ is independent of any single rollout's score
+function in expectation (a standard control-variate identity), so it
+contributes zero bias.  Hence the right-hand side equals
+$\nabla_\theta J(\theta)|_{\theta_\old}$.
+\end{proof}
+
+\begin{corollary}[Bias on the marginal policy]
+The estimator is unbiased for $J(\theta)$, i.e.\ for the expected reward of
+the mask-marginalized policy~\eqref{eq:marginal-policy}, since
+$\E_\xi[\pi_\theta(y\mid x,\xi)] = \bar\pi_\theta(y\mid x)$ implies
+$\E_{x,\xi,y\sim\Pi_\theta}[r] = \E_{x,y\sim\bar\pi_\theta}[r]$.  In other
+words, optimizing the augmented policy is exactly optimizing expected reward
+under the dropout ensemble.
+\end{corollary}
+
+\subsection{Variance reduction via mask replay (CRN)}
+
+Consider two estimators of $\nabla_\theta J$ at a perturbed parameter
+$\theta = \theta_\old + \Delta$:
+\begin{align}
+\hat g_{\mathrm{CRN}} &:=
+   A(\xi, y)\,\nabla_\theta \log \pi_\theta(y\mid x, \xi),
+   \quad \xi\text{ shared with rollout,}
+\\
+\hat g_{\mathrm{indep}} &:=
+   A(\xi, y)\,\nabla_\theta \log \pi_\theta(y\mid x, \xi'),
+   \quad \xi' \perp\!\!\!\perp \xi\text{ resampled.}
+\end{align}
+
+\begin{proposition}[CRN variance reduction]
+\label{prop:crn}
+Suppose the trajectory-conditional reward $\bar r(\xi) := \E_y[r \mid \xi]$ and
+the score function $s(\xi, y; \theta) := \nabla_\theta \log\pi_\theta(y\mid x,\xi)$
+are positively correlated across $\xi$, i.e.\
+$\Cov_\xi(\bar r(\xi),\,s(\xi,y;\theta)) \succeq 0$ component-wise.  Then
+\begin{equation}
+\Var[\hat g_{\mathrm{CRN}}] \;\le\; \Var[\hat g_{\mathrm{indep}}].
+\end{equation}
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Both estimators have the same mean (Theorem~\ref{thm:unbiased}).  Decompose
+each variance into a within-mask and across-mask component using the law of
+total variance.  The within-mask components are equal.  For the across-mask
+component, the resampling estimator $\hat g_{\mathrm{indep}}$ has uncorrelated
+$\bar r(\xi)$ and $s(\xi',y;\theta)$ (since $\xi'\perp\xi$), whereas
+$\hat g_{\mathrm{CRN}}$ has covariance equal to the assumed nonnegative
+quantity.  Subtracting yields the bound.  This is the standard CRN argument
+(Glasserman \& Yao, 1992, Thm 3.1) specialized to the score-function
+estimator.
+\end{proof}
+
+\begin{remark}
+The positive-correlation assumption is mild in practice: masks that yield a
+correct answer ($\bar r(\xi)$ large) also yield a score function that pushes
+$\theta$ in directions that increase $\pi_\theta$ on those tokens.  Empirical
+verification can be done by tracking the sign of the diagonal of
+$\Cov_\xi(\bar r, s)$ during training.
+\end{remark}
+
+\subsection{Connection to MC-dropout}
+
+Following Gal \& Ghahramani (2016), interpret each mask as a posterior sample
+$\theta_\xi := \theta\odot m(\xi)/q$ from a variational distribution
+$q_\theta(\theta')$ over parameters.  The marginal policy
+\eqref{eq:marginal-policy} is then
+\begin{equation}
+\bar\pi_\theta(y\mid x)
+  \;=\;
+\E_{\theta'\sim q_\theta}[\pi_{\theta'}(y\mid x)],
+\end{equation}
+i.e.\ a Bayesian-model-average policy.  Theorem~\ref{thm:unbiased} states
+that dropout-GRPO performs ensemble-aware policy optimization: each gradient
+step is the Monte Carlo average of per-ensemble-member policy gradients,
+with the group-normalized advantage acting as a control variate.
+
+% =====================================================================
+\section{Algorithm}
+% =====================================================================
+
+\begin{figure}[h]
+\centering
+\fbox{\begin{minipage}{0.92\linewidth}
+\textbf{Algorithm 1: Dropout-GRPO for latent-reasoning LLMs.}\\[2pt]
+\textit{Inputs:} base policy $\pi_{\theta_\old}$, prompts $\D$, group size
+$K$, dropout rate $p$, latent depth $T$, clip $\eps$, KL coef $\beta$,
+mini-epochs $E$.
+\begin{enumerate}[topsep=2pt,itemsep=1pt,leftmargin=*]
+\item For each prompt $x \sim \D$:
+  \begin{enumerate}[topsep=1pt,itemsep=1pt,label=\alph*.]
+  \item \emph{Rollout} (train mode, dropout on). For $k=1,\dots,K$:
+    sample fresh dropout RNG seeds, store seeds for $\xi^{(k)}$, unroll
+    latent recurrence \eqref{eq:dropout-recurrence}, decode $y^{(k)}$,
+    record per-token logprobs $\log\pi_{\theta_\old}(y^{(k)}\mid x,\xi^{(k)})$,
+    compute $r^{(k)} = \mathrm{verifier}(y^{(k)}, x)$.
+  \item Compute advantages
+        $A^{(k)} = (r^{(k)} - \mu_r)/(\sigma_r + \delta)$
+        as in \eqref{eq:grpo-advantage}.
+  \item \emph{Update} (mask replay). For mini-epoch $e=1,\dots,E$ and
+        each $k$: regenerate $\xi^{(k)}$ from stored seeds, recompute
+        $\log\pi_\theta(y^{(k)}\mid x, \xi^{(k)})$, form
+        $\rho^{(k)} = \pi_\theta/\pi_{\theta_\old}$, take a gradient step
+        on $\Loss^{\mathrm{GRPO}}$ from \eqref{eq:grpo-loss}.
+  \item Set $\theta_\old \gets \theta$.
+  \end{enumerate}
+\end{enumerate}
+\end{minipage}}
+\label{alg:dropout-grpo}
+\end{figure}
+
+% =====================================================================
+\section{Practical concerns and open questions}
+% =====================================================================
+
+\paragraph{Sensitivity of $h_T$ to $\xi$.}
+If dropout perturbations to $h_T$ do not change the argmax of the answer-token
+distribution, all $K$ rollouts agree, advantages collapse to zero, and no
+gradient is produced.  This is the dropout-rate analogue of temperature in
+token-level RL.  A diagnostic to monitor is the
+within-group standard deviation of $r^{(k)}$ (Eq.~\eqref{eq:grpo-advantage});
+if $\sigma_r \to 0$, raise $p$ or fold token-sampling Gumbel noise into $\xi$.
+
+\paragraph{Importance-ratio explosion.}
+The ratio $\rho_\theta(\xi,y)$ couples parameter updates and dropout-induced
+logit shifts, and can be large because dropping different units changes logits
+non-smoothly.  The PPO-style clip $\eps$ may need to be tightened relative to
+the token-LM regime, or applied per latent step rather than only per answer
+token.
+
+\paragraph{Validity of clip under CRN.}
+The clip operator in~\eqref{eq:grpo-loss} is non-smooth, so
+Theorem~\ref{thm:unbiased} as stated holds only at $\theta = \theta_\old$
+(initial step).  Standard PPO analysis (Schulman et al., 2017, \S 5) extends
+the bound to small steps under a Lipschitz condition on $\rho_\theta$, which
+in turn requires $\rho_\theta$ to remain bounded under mask replay; this is
+plausible but should be verified empirically (track max ratio).
+
+\paragraph{Train/deploy mismatch.}
+Inference typically disables dropout, so the deployed policy is
+$\pi_\theta(y\mid x, \xi=\mathbf 1)$ rather than the marginal
+$\bar\pi_\theta$.  Two options: (a)~keep dropout on at deploy time and average
+over masks, or (b)~accept a bias bounded by
+$\TV(\bar\pi_\theta,\,\pi_\theta(\cdot\mid \mathbf 1)) = \mathcal{O}(p\sqrt d)$
+under standard regularity assumptions on the network's Lipschitz constant in
+its mask argument.
+
+\paragraph{Memory for stored masks.}
+Storing $\xi^{(k)}$ for $K$ rollouts and $T$ latent steps over a $D$-parameter
+model costs $\mathcal{O}(KTD)$ bits.  In practice, only the dropout layers'
+masks need to be stored (not full-parameter masks), and a per-layer RNG seed
+is sufficient: store the seed, regenerate the mask deterministically at
+update time.  This is the recommended implementation.
+
+% =====================================================================
+\section{Summary}
+% =====================================================================
+
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item Latent-reasoning models break GRPO because the latent phase is
+      deterministic; dropout supplies the missing stochasticity without
+      changing the model class.
+\item Dropout noise is exogenous (independent of $\theta$), so it acts as a
+      reparameterization variable; the score function reduces to the
+      $\xi$-conditional log likelihood (Eq.~\ref{eq:score-reduces}).
+\item The latent gradient $\partial h_T/\partial \theta$ is well defined at
+      every depth $T$ (Lemma~\ref{lem:induction}), justifying backprop through
+      the unrolled latent recurrence.
+\item GRPO with replayed masks is an unbiased estimator of the policy
+      gradient on the dropout-augmented policy, hence on the marginal
+      policy (Theorem~\ref{thm:unbiased}).
+\item Replaying the rollout-time mask at update time gives a CRN coupling
+      that lower-bounds variance against the resample-at-update alternative
+      (Proposition~\ref{prop:crn}).
+\item Practical caveats are: $h_T$-sensitivity, importance-ratio control,
+      clip-region Lipschitz behavior, and train/deploy mismatch.
+\end{itemize}
+
+% =====================================================================
+\section*{References (informal)}
+% =====================================================================
+
+\begin{itemize}[topsep=2pt,itemsep=1pt,leftmargin=*]
+\item Hao, S.\ et al.\ (2024). \emph{Training large language models to reason
+      in a continuous latent space.}  (Coconut.)
+\item Shao, Z.\ et al.\ (2024).  \emph{DeepSeekMath: Pushing the limits of
+      mathematical reasoning in open language models.} (GRPO.)
+\item Schulman, J.\ et al.\ (2017).  \emph{Proximal policy optimization
+      algorithms.}
+\item Gal, Y.\ \& Ghahramani, Z.\ (2016).  \emph{Dropout as a Bayesian
+      approximation: Representing model uncertainty in deep learning.}
+\item Kingma, D.\ \& Welling, M.\ (2014).  \emph{Auto-encoding variational
+      Bayes.}
+\item Glasserman, P.\ \& Yao, D.D.\ (1992).  \emph{Some guidelines and
+      guarantees for common random numbers.}
+\end{itemize}
+
+\end{document}
