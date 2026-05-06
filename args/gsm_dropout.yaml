@@ -3,7 +3,8 @@
 # Main command:
 #   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout.py args/gsm_dropout.yaml
 #   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_2ref.py args/gsm_dropout.yaml
-#   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_variational.py args/gsm_dropout.yaml
+
+#   torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_variational.py args/gsm_dropout.yaml        ## THIS IS THE ONE
 
 project: coconut-grpo-dropout
 save_path: checkpoints
@@ -12,6 +13,7 @@ name: gsm-coconut-grpo-dropout
 verify_replay_embeddings: True
 restore_policy_rng: True
 strict_replay_structure: True
+variational_dropout: True   # True: locked mask across all latent steps. False: fresh per-step mask (ablation).
 reference_model_mode: dropout_matched   # deterministic | dropout_matched
 ref_model_device: cuda                 # cpu | cuda
 track_timing: False
@@ -34,7 +36,8 @@ train_path: data/svamp_gsm_hard_train.json
 # train_path_secondary: data/gsm_train.json
 train_path_secondary: data/openmath2_augmented_gsm8k.json
 dataset_mix_ratio: 0.2
-val_path: data/gsm_test.json
+val_path: data/gsm_valid.json
+test_path: data/gsm_test.json
 dataset_max_len: 96
 
 # load_model_path: checkpoints/checkpoint_21_260328_152119.pt         # c=2 ckpt, 20-ish%
@@ -45,14 +48,14 @@ reset_optimizer: True
 num_epochs: 1
 
 weight_decay: 0.01
-seed: 124
+seed: 125
 dropout: 0.1
 num_latents: 6
 eval_num_latents: 6
 max_new_tokens: 32
 
 # Rollout results filtering - remove prompts if they are too easy/hard                                                                                                
-enable_group_filter: true                                                                                                                                                                                        
+enable_group_filter: True                                                                                                                                                                                        
 filter_min_accuracy: 0.20                                                                                                                                                                                        
 filter_max_accuracy: 0.98                        
 
@@ -83,7 +86,11 @@ num_steps: 3000
 warmup_steps: 200
 eval_per_steps: 100
 ref_model_renewal_steps: 500     # sharp reduction from previous 100
-enable_faster_warmup_renewal: false
+enable_faster_warmup_renewal: False
+
+# Ablations
+use_reinforce: True
+ema_baseline_alpha: 0.95
 
 sdpa_attention: False
 grad_checkpointing: False

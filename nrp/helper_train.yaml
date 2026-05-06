@@ -24,3 +24,6 @@ spec:
   - name: storage-volume
     persistentVolumeClaim:
       claimName: train-pvc
+
+
+# Wandb key: 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

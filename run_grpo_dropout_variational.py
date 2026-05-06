@@ -89,6 +89,7 @@ import os
 import sys
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 import argparse
 import copy
@@ -109,6 +110,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from coconut import Coconut
 from coconut_variational import CoconutVariational
 from dataset import get_dataset, get_grpo_dataset, MyCollator
 from utils import Config, set_seed
@@ -517,6 +519,34 @@ def compute_group_advantages(rewards, num_rollouts):
     return advantages.reshape(-1)
 
 
+# REINFORCE ablation: drop the group-mean baseline and use a running
+# scalar EMA of past batch-mean rewards. Standard control-variate;
+# update is applied AFTER advantages are computed so the current step
+# uses the previous EMA (preserves zero bias of the baseline).
+#
+# Use case: K=1 rollout per prompt. With K=1 the group-mean baseline
+# collapses to A = r - r = 0, so a different baseline is required to
+# get any gradient signal. Selected via configs.use_reinforce.
+class EMABaseline:
+    def __init__(self, alpha=0.95):
+        self.alpha = alpha
+        self.b = None
+
+    def advantages(self, rewards):
+        b = 0.0 if self.b is None else self.b
+        return rewards - b
+
+    def update(self, batch_mean):
+        if self.b is None:
+            self.b = float(batch_mean)
+        else:
+            self.b = self.alpha * self.b + (1.0 - self.alpha) * float(batch_mean)
+
+    @property
+    def value(self):
+        return 0.0 if self.b is None else self.b
+
+
 def configure_dropout(model_config, dropout):
     for attr in [
         "attention_dropout",
@@ -591,6 +621,35 @@ def main():
 
     configs = Config(config_dict)
     set_seed(configs.seed)
+
+    # REINFORCE ablation auto-coercion. When use_reinforce=True, the
+    # group-baseline / group-filter / zero-var-mask machinery is undefined
+    # at K=1, so we force the dependent settings to a consistent state:
+    #   num_rollouts = 1                 (one rollout per prompt)
+    #   rollout_chunk_size = train_batch_size
+    #   policy_minibatch_size = train_batch_size
+    #   enable_group_filter = False      (mu_r filter undefined at K=1)
+    # The chunk == minibatch == batch_size sizing keeps each chunk a
+    # batched forward pass over different prompts, each with its own
+    # dropout mask (PyTorch's dropout draws fresh masks per batch row
+    # within a single forward call, even under shared chunk RNG seed).
+    use_reinforce = bool(getattr(configs, "use_reinforce", False))
+    if use_reinforce:
+        forced = {
+            "num_rollouts": 1,
+            "rollout_chunk_size": configs.train_batch_size,
+            "policy_minibatch_size": configs.train_batch_size,
+            "enable_group_filter": False,
+        }
+        for key, val in forced.items():
+            prev = getattr(configs, key, None)
+            if prev != val and rank == 0:
+                print(
+                    f"[REINFORCE] Coercing {key}: {prev!r} -> {val!r} "
+                    f"(use_reinforce=True)."
+                )
+            configs.__dict__[key] = val
+
     configs.__dict__["start_time"] = current_time
     save_dir = os.path.join(configs.save_path, configs.name, current_time)
     # D2: default to "dropout_matched" so KL anchor is evaluated under the
@@ -709,9 +768,16 @@ def main():
 
     ref_model = None
     ref_model_device = torch.device("cpu" if ref_model_device_name == "cpu" else f"cuda:{local_rank}")
+    # variational_dropout=True (default): single locked mask reused across all
+    # latent recurrence steps (Gal & Ghahramani). False: fresh mask drawn per
+    # step (standard dropout). Per-step xi sequence is still replayable because
+    # the trainer captures+restores RNG state at chain start, so theta_old and
+    # ref replay reproduce the same sequence of Bernoulli draws.
+    use_variational_dropout = getattr(configs, "variational_dropout", True)
+    coconut_cls = CoconutVariational if use_variational_dropout else Coconut
     if configs.coconut:
         ref_base_model = copy.deepcopy(model)
-        ref_model = CoconutVariational(
+        ref_model = coconut_cls(
             ref_base_model,
             latent_id,
             start_id,
@@ -722,7 +788,7 @@ def main():
             ref_model = ref_model.to(dtype=torch.bfloat16)
         ref_model = ref_model.to(device=ref_model_device)
 
-        model = CoconutVariational(
+        model = coconut_cls(
             model,
             latent_id,
             start_id,
@@ -744,7 +810,9 @@ def main():
     for param in ref_model.parameters():
         param.requires_grad_(False)
 
-    if configs.verify_replay_embeddings:
+    # Mask audit only meaningful for variational mode (asserts identical masks
+    # across recurrence steps). Per-step ablation expects masks to differ.
+    if configs.verify_replay_embeddings and use_variational_dropout:
         model.enable_mask_audit(strict=True)
 
     parallel_model = DDP(model, device_ids=[local_rank])
@@ -764,6 +832,24 @@ def main():
         tokenizer,
         max_size=32 if configs.debug else 100000000,
     )
+
+    test_path = getattr(configs, "test_path", "None")
+    has_test_set = test_path != "None" and test_path is not None
+    if has_test_set:
+        question_test = [d["question"] for d in json.load(open(test_path))]
+        answers_test = [
+            d["answer"].replace(",", "").strip()
+            for d in json.load(open(test_path))
+        ]
+        base_dataset_test = get_dataset(
+            test_path,
+            tokenizer,
+            max_size=32 if configs.debug else 100000000,
+        )
+    else:
+        question_test = None
+        answers_test = None
+        base_dataset_test = None
 
     if not configs.only_eval:
         total_train_samples = (
@@ -839,6 +925,11 @@ def main():
         getattr(configs, "print_first_batch_outputs", False),
     )
 
+    # REINFORCE ablation baseline (only used when use_reinforce=True).
+    ema_baseline = EMABaseline(
+        alpha=float(getattr(configs, "ema_baseline_alpha", 0.95))
+    )
+
     for epoch in range(configs.resume, configs.num_epochs):
         if "train_dataloader" in locals():
             del train_dataloader
@@ -848,6 +939,10 @@ def main():
             del valid_gen_dataloader
         if "dataset_gen_val" in locals():
             del dataset_gen_val
+        if "test_gen_dataloader" in locals():
+            del test_gen_dataloader
+        if "dataset_gen_test" in locals():
+            del dataset_gen_test
         gc.collect()
 
         dataset_gen_val = get_grpo_dataset(
@@ -866,6 +961,26 @@ def main():
             collate_fn=collator,
             sampler=DistributedSampler(dataset_gen_val, shuffle=False),
         )
+
+        if has_test_set:
+            dataset_gen_test = get_grpo_dataset(
+                base_dataset_test,
+                start_id,
+                no_special_marker=configs.cot
+                or configs.no_cot
+                or configs.no_thoughts
+                or configs.no_bot_tokens,
+            )
+            test_gen_dataloader = torch.utils.data.DataLoader(
+                dataset_gen_test,
+                num_workers=1,
+                pin_memory=True,
+                batch_size=configs.eval_batch_size,
+                collate_fn=collator,
+                sampler=DistributedSampler(dataset_gen_test, shuffle=False),
+            )
+        else:
+            test_gen_dataloader = None
 
         if not configs.only_eval:
             dataset_train = get_grpo_dataset(
@@ -1261,7 +1376,16 @@ def main():
                 prompt_masks_cpu = torch.cat(all_prompt_masks, dim=0).to(device)
                 token_ids = generated_all.to(device)
                 reward_tensor = torch.tensor(all_rewards, device=device, dtype=torch.float32)
-                advantages = compute_group_advantages(reward_tensor, configs.num_rollouts)
+                if use_reinforce:
+                    # A^(k) = r^(k) - b_t, with b_t the EMA of past batch
+                    # mean rewards. Compute advantages first (using the
+                    # PRE-update baseline so the current batch's reward is
+                    # not in its own baseline -> preserves zero bias),
+                    # then update the EMA with this batch's mean reward.
+                    advantages = ema_baseline.advantages(reward_tensor)
+                    ema_baseline.update(reward_tensor.mean().item())
+                else:
+                    advantages = compute_group_advantages(reward_tensor, configs.num_rollouts)
 
                 adv_clip = getattr(configs, "advantage_clip", 5.0)          # clip against advantage blow-up in near-uniform cases
                 advantages = advantages.clamp(min=-adv_clip, max=adv_clip)
@@ -1284,10 +1408,23 @@ def main():
                 #     wrong, only medium prompts produce signal. Healthy
                 #     < 0.3, problematic > 0.5.
                 with torch.no_grad():
-                    reward_grouped = reward_tensor.view(-1, configs.num_rollouts)
-                    group_std = reward_grouped.std(dim=1)
-                    reward_std_within_group = group_std.mean().item()
-                    frac_zero_var_groups = (group_std < 1e-6).float().mean().item()
+                    if configs.num_rollouts >= 2:
+                        reward_grouped = reward_tensor.view(-1, configs.num_rollouts)
+                        group_std = reward_grouped.std(dim=1)
+                        reward_std_within_group = group_std.mean().item()
+                        frac_zero_var_groups = (group_std < 1e-6).float().mean().item()
+                    else:
+                        # K=1 (REINFORCE): within-group std is undefined;
+                        # report 0 and keep group_std as a per-rollout
+                        # zero tensor so any downstream consumer sees a
+                        # consistent shape.
+                        group_std = torch.zeros(
+                            reward_tensor.numel(),
+                            device=reward_tensor.device,
+                            dtype=reward_tensor.dtype,
+                        )
+                        reward_std_within_group = 0.0
+                        frac_zero_var_groups = 0.0
                     adv_abs = advantages.abs()
                     adv_abs_mean = adv_abs.mean().item()
                     adv_abs_max = adv_abs.max().item()
@@ -1397,7 +1534,13 @@ def main():
                 # and kl_loss aggregation. total_nonmasked recomputed
                 # below uses the masked version, so the loss denominator
                 # shrinks honestly.
-                if getattr(configs, "mask_zero_var_groups", True):
+                # REINFORCE disables zero-variance group masking: with K=1
+                # there is no within-group std, group_std is a fill-value
+                # zero tensor (see Advantage Diagnostics block above), and
+                # masking against std==0 would zero every rollout. The EMA
+                # baseline supplies the variance-reduction role that the
+                # group baseline + zero-var mask jointly serve in GRPO.
+                if not use_reinforce and getattr(configs, "mask_zero_var_groups", True):
                     group_valid_per_group = (group_std > 1e-6).to(ref_loss_mask.device)
                     group_valid_per_rollout = group_valid_per_group.repeat_interleave(
                         configs.num_rollouts
@@ -1702,6 +1845,13 @@ def main():
                             else float(pre_clip_grad_norm),
                         }
                     )
+                    if use_reinforce:
+                        # EMA baseline tracker for the REINFORCE ablation.
+                        # Should drift toward the running mean reward;
+                        # large gap to batch_avg_reward implies high
+                        # advantage variance (alpha too high) or stale
+                        # baseline (alpha too low).
+                        wandb_step_payload["train_adv/ema_baseline"] = ema_baseline.value
                     wandb_run.log(wandb_step_payload, step=global_step)
 
                 pbar.update(1)
@@ -1744,21 +1894,55 @@ def main():
                         rank,
                         desc=f"Eval @ step {step + 1}",
                     )
+
+                    test_correct_step = None
+                    test_total_step = None
+                    if has_test_set:
+                        test_savepath_step = os.path.join(
+                            save_dir,
+                            f"checkpoint_{epoch + 1}_step_{step + 1}_test_{current_time}.txt",
+                        )
+                        test_correct_step, test_total_step = run_validation(
+                            parallel_model,
+                            test_gen_dataloader,
+                            tokenizer,
+                            configs,
+                            latent_id,
+                            eval_num_latents,
+                            max_new_tokens,
+                            device,
+                            test_savepath_step,
+                            question_test,
+                            rank,
+                            desc=f"Test @ step {step + 1}",
+                        )
+
                     if rank == 0:
                         eval_acc = correct_step / max(total_step, 1)
                         print(
                             f"[Step {step + 1}] Validation accuracy: "
                             f"{correct_step} / {total_step} = {eval_acc:.4f}"
                         )
-                        if wandb_run:
-                            wandb_run.log(
-                                {
-                                    "eval/acc": eval_acc,
-                                    "eval/correct": correct_step,
-                                    "eval/total": total_step,
-                                },
-                                step=global_step,
+                        log_payload = {
+                            "eval/acc": eval_acc,
+                            "eval/correct": correct_step,
+                            "eval/total": total_step,
+                        }
+                        if has_test_set:
+                            test_acc = test_correct_step / max(test_total_step, 1)
+                            print(
+                                f"[Step {step + 1}] Test accuracy: "
+                                f"{test_correct_step} / {test_total_step} = {test_acc:.4f}"
                             )
+                            log_payload.update(
+                                {
+                                    "test/acc": test_acc,
+                                    "test/correct": test_correct_step,
+                                    "test/total": test_total_step,
+                                }
+                            )
+                        if wandb_run:
+                            wandb_run.log(log_payload, step=global_step)
 
                         if not configs.save_only_improve or eval_acc >= best_eval_acc or (step + 1) % configs.mandatory_save_per_epochs == 0:
                             ckpt_path_eval = os.path.join(save_dir, "ref_models", f"checkpoint_{epoch + 1}_step_{step + 1}_{int(eval_acc * 10000)}.pt")
@@ -1793,16 +1977,45 @@ def main():
             eval_savepath,
             question_val,
             rank,
-            desc="Test Accuracy",
+            desc="Validation Accuracy",
         )
+
+        test_correct_end = None
+        test_total_end = None
+        if has_test_set:
+            test_savepath = os.path.join(
+                save_dir,
+                f"checkpoint_{epoch + 1}_test_{current_time}.txt",
+            )
+            test_correct_end, test_total_end = run_validation(
+                parallel_model,
+                test_gen_dataloader,
+                tokenizer,
+                configs,
+                latent_id,
+                eval_num_latents,
+                max_new_tokens,
+                device,
+                test_savepath,
+                question_test,
+                rank,
+                desc="Test Accuracy",
+            )
 
         if rank == 0:
             eval_acc_end = correct_end / max(total_end, 1)
             print(
                 f"Accuracy on validation set: {correct_end} / {total_end} = {eval_acc_end}"
             )
+            end_log = {"eval/acc": eval_acc_end}
+            if has_test_set:
+                test_acc_end = test_correct_end / max(test_total_end, 1)
+                print(
+                    f"Accuracy on test set: {test_correct_end} / {test_total_end} = {test_acc_end}"
+                )
+                end_log["test/acc"] = test_acc_end
             if wandb_run:
-                wandb_run.log({"eval/acc": eval_acc_end})
+                wandb_run.log(end_log)
 
         if configs.only_eval:
             break

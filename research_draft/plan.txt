@@ -1,0 +1,71 @@
+Introduction
+- brief introduction of latent models
+- brief introduction of Coconut, why it's important
+- brief introduction of GRPO as a popular and effective RL technique for math modeling since DeepSeek
+- introduce dropout as a necessary and simple tool for introducing stochasticity necessary for GRPO
+- explain the contribution of the work, the scope, and what it brings to the table
+
+Related Work
+1. Latent-space thinking
+- inception and evolution of latent reasoning models (check out coconut_grpo and LEPO)
+- recent works
+
+2. Reinforcement Learning
+- first implementation, PPO, GRPO, LLM-as-judge
+- also talk about how latent models struggled to implement GRPO due to implicit stochasticity
+
+Methodology
+1. Latent space thinking
+- explain basics of how it works in pseudo-math
+- also include detailed descriptions of the model's inner workings (how latent tokens are used to signal beginning/end)
+
+2. Supervised Fine-tuning
+- "apply standard SFT without modifications"
+- Following Coconut SFT procedure
+   - mention the training objective
+
+3. Dropout-GRPO
+- main contribution of paper
+- explain how it is difficult to construct a value model for a latent step, as latent landscape changes with even a single step.
+- explain theoretical "proof" is constructed
+
+4. Performance measures
+- pass@k
+- # tokens
+
+
+Experimental Setup
+1. Model used
+- Qwen2.5-1.5B
+- Justify deviation from Coconut by explaining left-padding bias for absolute positional embedding in GPT-2 
+- list ablation models
+
+2. Dataset
+- GSM8k-aug for SFT
+- GSM8k-hard + SVAMP + Openmath2-augmented-GSM8k for GRPO
+- GSM8k for testing + others
+- Justify dataset choice by explaining a similar landscape to SFT data was necessary
+- Justify lack of ablation by explaining datasets with concise intermediate steps like GSM8k-aug is difficult to come by
+- Note that steps are not necessary for GRPO step
+- Justify not using language reasoning tasks, such as ProsQA as given in original paper, stating that it is already saturated (maybe skip this if it makes paper sound weak)
+
+3. Training Details
+- Explain how each model was trained, how many samples were used, etc.
+- Include all the tweaks, such as DAPO-style zero-var masking, Dr.GRPO-style removal of sigma division in group normalization, and Huberized K3 KL
+
+
+Results
+- Evaluating Qwen base
+   - Zero-shot is ridiculous, but still included. Use with 1-shot as well. 
+- Coconut ablation
+   - explain necessity of coconut SFT procedure
+   - explain how proposed approach tweaks Coconut formula
+   
+Conclusion
+- Summarize what was done
+   - explain briefly how Coconut-style latent reasoning models cannot generate stochasticity by default, and how dropout-GRPO solves this.
+   - explain how models were evaluated
+- List some directions for future work
+   - expand Coconut-style reasoning to Chain-of-thought datasets, which are popular and easier to obtain
+   - further improve dropout-GRPO algorithm, including stability, performance, and scalability across multi-GPU training
+- Denote that pure-latent reasoning models still suck at math, but further improvements that allow RL such as dropout-GRPO may be key to unlocking a new frontier

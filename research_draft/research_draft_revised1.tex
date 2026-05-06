@@ -66,9 +66,7 @@ provided in \texttt{coconut\_variational.py} and
 \section{Revision summary}
 % =====================================================================
 
-This revision corrects two errors and one ambiguity in the previous draft,
-and documents four implementation refinements adopted during empirical
-debugging.
+This revision corrects two errors and one ambiguity in the previous draft:
 
 \begin{itemize}[topsep=2pt,itemsep=2pt]
 \item \textbf{Hole 1 (advantage normalization).}  The original draft used
@@ -102,25 +100,10 @@ debugging.
       RNG-restore mechanism.  Section~\ref{sec:mc-dropout} of this
       revision relies on that shared-mask construction and gives the
       Bayesian model-average reading rigorously.
-\item \textbf{Implementation refinements (V4--V7).}  Section~\ref{sec:impl}
-      documents four changes adopted to stabilize training in practice:
-      (V4) a Huberized $k_3$ KL estimator that keeps tail gradients bounded
-      but nonzero, replacing the standard log-ratio clamp;
-      (V5) an annealed KL coefficient $\beta(t) = \beta_0 \cdot \eta_t/\eta_{\max}$
-      that shrinks the trust-region pull alongside the learning-rate
-      schedule;
-      (V6) sequence-mean loss aggregation in place of token-mean, matching
-      Algorithm~\ref{alg:dropout-grpo} and removing length-weighting
-      artifacts;
-      (V7) a group-level accuracy filter
-      $\alpha_{\min} \le \mu_{r}^{(g)} \le \alpha_{\max}$ that drops
-      uninformative groups before any replay or policy update, with
-      collective DDP coordination so that empty global batches skip the
-      step entirely (no optimizer step, no scheduler step).
 \end{itemize}
 
-The well-definedness lemma, the smoothness assumption, and the original
-practical discussion are unchanged in substance.
+The well-definedness lemma, the smoothness assumption, and the practical
+discussion are unchanged in substance.
 
 % =====================================================================
 \section{Introduction and motivation}
@@ -668,10 +651,8 @@ verifies the bit-identity property at runtime.
 \fbox{\begin{minipage}{0.92\linewidth}
 \textbf{Algorithm 1: Dropout-GRPO for latent-reasoning LLMs (revised).}\\[2pt]
 \textit{Inputs:} base policy $\pi_{\theta_\old}$, prompts $\D$, group size
-$K$, dropout rate $p$, latent depth $T$, clip $\eps$, peak KL coef
-$\beta_0$, mini-epochs $E$, filter bounds
-$[\alpha_{\min}, \alpha_{\max}]$, Huber threshold $\delta$, lr schedule
-$\eta_t$ with peak $\eta_{\max}$.
+$K$, dropout rate $p$, latent depth $T$, clip $\eps$, KL coef $\beta$,
+mini-epochs $E$.
 \begin{enumerate}[topsep=2pt,itemsep=1pt,leftmargin=*]
 \item For each prompt $x \sim \D$:
   \begin{enumerate}[topsep=1pt,itemsep=1pt,label=\alph*.]
@@ -683,196 +664,22 @@ $\eta_t$ with peak $\eta_{\max}$.
     record per-token logprobs
     $\log\pi_{\theta_\old}(y^{(k)}\mid x,\xi^{(k)})$;
     compute $r^{(k)} = \mathrm{verifier}(y^{(k)}, x)$.
-  \item \emph{Group filter (V7).} Compute the empirical group accuracy
-        $\mu_r = \tfrac1K\sum_k r^{(k)}$.  If
-        $\alpha_{\min} \le \mu_r \le \alpha_{\max}$, keep the group;
-        otherwise drop it from this step's update set.  Coordinate the
-        decision across DDP ranks via \texttt{all\_reduce}: if no group
-        passes anywhere, skip the entire optimizer / scheduler step
-        for this batch and proceed to the next.
   \item Compute advantages
-        $A^{(k)} = r^{(k)} - \mu_r$ on the kept groups
-        (\emph{no $\sigma_r$ normalization}; cf.\ Remark~\ref{rem:sigma}).
+        $A^{(k)} = r^{(k)} - \mu_r$
+        as in~\eqref{eq:grpo-advantage}.
+        \emph{(No $\sigma_r$ normalization.)}
   \item \emph{Update} (mask replay). For mini-epoch $e=1,\dots,E$ and
-        each kept $k$: regenerate $\xi^{(k)}$ from stored seed
-        (RNG-restore at every latent step), recompute
+        each $k$: regenerate $\xi^{(k)}$ from stored seed (RNG-restore
+        at every latent step), recompute
         $\log\pi_\theta(y^{(k)}\mid x, \xi^{(k)})$, form
         $\rho^{(k)} = \pi_\theta/\pi_{\theta_\old}$, take a gradient
-        step on the loss
-        \begin{equation*}
-        \Loss(\theta) \;=\;
-          -\,\tfrac{1}{K_{\mathrm{kept}}}\!\sum_{k\,\mathrm{kept}}\!
-            \tfrac{1}{|y^{(k)}|}\!\sum_{\ell}
-            \min\!\big(\rho_\ell^{(k)} A^{(k)},\,
-              \mathrm{clip}(\rho_\ell^{(k)},1\pm\eps) A^{(k)}\big)
-          \;+\; \beta(t)\,\tilde k_3(r^{\mathrm{ref}})
-        \end{equation*}
-        where the per-rollout token sum is divided by the rollout
-        length (V6, sequence-mean), $\beta(t) = \beta_0\,\eta_t/\eta_{\max}$
-        anneals with the lr schedule (V5), and $\tilde k_3$ is the
-        Huberized $k_3$ KL estimator of~\eqref{eq:huber-kl} below (V4).
+        step on $\Loss^{\mathrm{GRPO}}$ from~\eqref{eq:grpo-loss}.
   \item Set $\theta_\old \gets \theta$.
   \end{enumerate}
 \end{enumerate}
 \end{minipage}}
 \label{alg:dropout-grpo}
 \end{figure}
-
-% =====================================================================
-\section{Implementation refinements}
-\label{sec:impl}
-% =====================================================================
-
-The theory in Sections~\ref{sec:method}--\ref{sec:mc-dropout} is unchanged
-by the four implementation details below; each was adopted to address a
-specific empirical pathology observed during training.
-
-\subsection{Huberized $k_3$ KL estimator (V4)}
-
-The $k_3$ KL estimator (Schulman, blog) used in the surrogate is
-$k_3(r) = \exp(r) - r - 1$ with $r := \log\pi_\theta - \log\pi_{\mathrm{ref}}$.
-A standard implementation choice is to clamp $r$ to $[-\delta, \delta]$
-before evaluating $k_3$, on the grounds that $\exp(r)$ overflows for large
-$r$.  This has the unintended effect of zeroing the gradient outside
-$[-\delta, \delta]$ (the autograd derivative of \texttt{clamp} is zero
-beyond its bounds), so any token whose log-ratio drifts past $\pm\delta$
-escapes KL regularization entirely.  Empirically this is the dominant
-pre-collapse signature: a small tail of escaped tokens drifts further with
-no restoring force, eventually dragging the whole policy with it.
-
-We replace the clamp with a Huber-style extension: $k_3$ inside, linear
-extrapolation outside, value- and slope-matched at $\pm\delta$:
-\begin{equation}
-\tilde k_3(r) \;=\;
-\begin{cases}
-\exp(r) - r - 1
-  & |r| \le \delta, \\[4pt]
-(\mathrm{e}^{\delta} - 1)(r - \delta) + (\mathrm{e}^{\delta} - \delta - 1)
-  & r > \delta, \\[4pt]
-(\mathrm{e}^{-\delta} - 1)(r + \delta) + (\mathrm{e}^{-\delta} + \delta - 1)
-  & r < -\delta.
-\end{cases}
-\label{eq:huber-kl}
-\end{equation}
-By construction $\tilde k_3 \in C^1(\R)$, $\tilde k_3 \ge 0$, and the
-gradient $\tilde k_3'(r)$ is bounded in magnitude by $\mathrm{e}^{\delta} - 1$
-in the right tail (and by $|\mathrm{e}^{-\delta} - 1| < 1$ in the left
-tail) but is \emph{nonzero} everywhere outside $r = 0$.  Drifted tokens
-therefore continue to feel a restoring pull, while the maximum per-token
-contribution stays bounded.  In practice we use $\delta = 5$, giving a
-maximum slope of $\mathrm{e}^5 - 1 \approx 147$.
-
-\subsection{Trust-region annealing of $\beta$ (V5)}
-
-With the lr schedule cosine-annealing from $\eta_{\max}$ to $\eta_{\min}$
-post-warmup, holding $\beta$ fixed produces a slowly worsening dynamic:
-the per-step policy update shrinks with $\eta_t$, but the per-step KL
-pull is $\eta_t \cdot \beta \cdot \nabla\KL$, also linear in $\eta_t$, so
-the \emph{relative} KL pull stays constant.  However, the policy gradient
-direction integrates informatively across steps while the KL gradient
-adds coherently toward $\theta_{\mathrm{ref}}$; once the policy reaches
-the equilibrium where these magnitudes balance, further updates are pinned.
-
-We anneal $\beta$ proportionally with $\eta_t$:
-\begin{equation}
-\beta(t) \;=\; \beta_0 \cdot \frac{\eta_t}{\eta_{\max}},
-\label{eq:beta-anneal}
-\end{equation}
-so the per-update KL pull scales with $\eta_t^2$ rather than $\eta_t$.
-This shifts the trust-region equilibrium outward as the lr decays, letting
-the policy continue to drift away from $\pi_{\mathrm{ref}}$ on the slow
-schedule.  During warmup, $\eta_t$ rises from near zero to $\eta_{\max}$,
-and $\beta(t)$ rises with it: the policy has near-zero KL pull early on,
-allowing free movement before the regularizer engages.
-
-\subsection{Sequence-mean loss aggregation (V6)}
-
-The original Algorithm~1 averaged $\Loss^{\mathrm{GRPO}}$ over rollouts but
-left the per-rollout token aggregation unspecified.  The natural reading
-matches the per-rollout normalization in
-Algorithm~\ref{alg:dropout-grpo}: the per-token loss within rollout $k$
-is averaged over its $|y^{(k)}|$ response tokens, and the resulting
-per-rollout scalars are then averaged across $k$.  An alternative
-``token-mean'' aggregation (sum all per-token losses, divide by total
-token count across the batch) implicitly weights each rollout by its
-length, entangling per-rollout influence with response length and
-underweighting short responses.
-
-For binary verifier rewards on math benchmarks, response lengths can vary
-several-fold (concise correct answers vs.\ long incorrect ones), so the
-two aggregations give visibly different gradient directions.  We use
-sequence-mean throughout.  At $\theta = \theta_{\mathrm{old}}$ the policy
-term reduces to $-A^{(k)}$ per rollout, and after summing across kept
-rollouts in a group its expectation is exactly zero (by
-$\sum_k A^{(k)} = 0$); the scalar loss displayed in training logs is
-therefore dominated by the $\beta\,\tilde k_3$ term and is small in
-absolute terms.  This is not a sign of vanishing gradient: the
-per-rollout score $-A^{(k)}\,\nabla\log\pi_\theta(y^{(k)}\mid x,\xi^{(k)})$
-is signed and uncorrelated across rollouts, so the gradient does not
-cancel even when its scalar evaluation does.  Monitoring should use
-$\|\nabla\Loss\|$ (or wandb \texttt{train/grad\_norm}) rather than the
-loss value itself.
-
-\subsection{Group-level accuracy filter and online curriculum (V7)}
-
-The within-group reward standard deviation $\sigma_r$ has long been used
-as a diagnostic for ``dead'' groups (Yu et al.\ 2024; ``Dynamic Sampling''
-in DAPO).  We extend the diagnostic to a \emph{filter}: at the end of the
-rollout phase, drop groups whose empirical accuracy
-$\mu_r = \tfrac1K\sum_k r^{(k)}$ falls outside a configured window
-$[\alpha_{\min}, \alpha_{\max}]$, where the defaults are $0.05$ and $0.95$
-(a factor-of-two looser bound than DAPO's $\sigma_r > 0$, which
-corresponds to $\mu_r \in (0, 1)$ but with hard endpoints).
-
-The motivation is twofold.  First, groups at $\mu_r \approx 0$ (all
-rollouts wrong, model can't yet solve) and $\mu_r \approx 1$ (all
-rollouts right, model has mastered) carry no comparative information:
-$A^{(k)} = r^{(k)} - \mu_r \approx 0$ for every $k$, so the per-token
-gradient is essentially noise.  Second, dropping these groups
-\emph{before} replay saves the corresponding theta-old / reference /
-policy backward compute --- in our setup roughly $25\%$ of step time per
-filtered group.
-
-The filter can be tightened further (e.g.\ $0.15 \le \mu_r \le 0.85$) once
-the policy is past the ``barely solving'' regime; this concentrates
-compute on the ``marginal'' middle band where signal-to-noise is highest.
-As the policy improves, the marginal band itself shifts: an online
-curriculum emerges with no explicit data ordering.
-
-\paragraph{Compatibility with Theorem~\ref{thm:unbiased}.}
-The filter is a function of the rollout outcomes
-$\{r^{(k)}\}_{k=1}^K$, which depend on $\theta$ through $y^{(k)}$.  It is
-therefore not exogenous, and the unbiasedness statement of
-Theorem~\ref{thm:unbiased} no longer applies to $\nabla J(\theta)$ on the
-original prompt distribution.  What it does apply to is
-$\nabla J_{\mathrm{filt}}(\theta) :=
-   \E_{x \sim \D}\big[ \E_{(\xi,y)\sim\Pi_\theta}[r(y,x)] \;\big|\;
-   \mu_r(x) \in [\alpha_{\min},\alpha_{\max}] \big]$,
-i.e.\ the expected reward conditional on the filter accepting.  The
-implicit reweighting of the prompt distribution toward the marginal
-band is the curriculum effect, by design.  In particular, with
-$\alpha_{\min} = 0$ and $\alpha_{\max} = 1$ the filter is exactly the
-zero-variance mask, and Theorem~\ref{thm:unbiased} recovers up to the
-zero-variance subset (where $A^{(k)} \equiv 0$ contributes nothing
-anyway).
-
-\paragraph{Skip coordination under DDP.}
-DDP requires every rank to run \texttt{loss.backward()} in lockstep --- a
-rank that skips its backward pass causes the others to hang on gradient
-sync.  We coordinate filter decisions globally via
-\texttt{dist.all\_reduce} on the per-rank kept-group count: if the global
-count is zero, every rank skips the policy update for this batch (no
-optimizer step, no scheduler step --- a true no-op step, advancing only
-the data iterator and step counter); if the global count is positive but
-some rank has zero kept groups locally, that rank falls back to using
-all its groups (whose pure-KL gradient is then diluted by $1/W$ in the
-DDP gradient average over $W$ ranks).  In the symmetric multi-rank
-regime the dilution is bounded; in the asymmetric regime where it would
-not be, the all-zero global case dominates and a true skip is taken.
-The constraint
-$\texttt{rollout\_chunk\_size} = K$ ensures each chunk corresponds to
-exactly one group, so dropping a group is a clean structural operation
-that preserves the chunk-aligned RNG-restore replay.
 
 % =====================================================================
 \section{Practical concerns and open questions}
@@ -970,18 +777,6 @@ sweeping group sizes.
       Bayesian model average $\bar\pi_\theta(y\mid x)
         = \E_{\theta'\sim q_\theta}[\pi_{\theta'}(y\mid x)]$
       (Section~\ref{sec:mc-dropout}, Eq.~\ref{eq:bma}).
-\item Four implementation refinements (Section~\ref{sec:impl}) stabilize
-      training without altering the theoretical claims:
-      Huberized $k_3$ KL with bounded but nonzero tail gradient
-      (Eq.~\ref{eq:huber-kl});
-      lr-coupled annealing of $\beta$
-      (Eq.~\ref{eq:beta-anneal}) to keep the trust region proportional to
-      the step size;
-      sequence-mean loss aggregation in line with Algorithm~\ref{alg:dropout-grpo};
-      and a group-level accuracy filter
-      $\alpha_{\min} \le \mu_r \le \alpha_{\max}$ with collective DDP
-      skip coordination, acting as an online curriculum that targets the
-      marginal-difficulty band where signal-to-noise is highest.
 \item Practical caveats are: $h_T$-sensitivity, importance-ratio control,
       clip-region Lipschitz behavior, KL anchor handling, and
       train/deploy mismatch.
@@ -999,9 +794,6 @@ sweeping group sizes.
 \item Liu, Z.\ et al.\ (2024).  \emph{Understanding R1-Zero-like training:
       A critical perspective.} (Dr.\ GRPO --- bias of $\sigma_r$
       normalization.)
-\item Yu, Q.\ et al.\ (2024).  \emph{DAPO: An open-source LLM reinforcement
-      learning system at scale.}  (Dynamic sampling / zero-variance group
-      filtering.)
 \item Schulman, J.\ et al.\ (2017).  \emph{Proximal policy optimization
       algorithms.}
 \item Schulman, J.\ et al.\ (2015).  \emph{Gradient estimation using

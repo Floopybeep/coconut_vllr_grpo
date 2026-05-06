@@ -1,0 +1,248 @@
+% =====================================================================
+% Combined Preliminaries + Theoretical Framework section.
+% Drop-in replacement for Sections 3 and 4 of research_draft_claude.tex.
+% Both \label{sec:prelim} and \label{sec:theory} are emitted so existing
+% cross-references in the intro resolve to this single section.
+% =====================================================================
+
+\section{Theoretical Framework}
+\label{sec:theory}
+\label{sec:prelim}
+
+We first fix notation for the Coconut latent recurrence, GRPO, and the
+shared-mask dropout construction (Section~\ref{sec:theory-setup}); we
+then establish well-definedness of the latent gradient
+(Section~\ref{sec:theory-welldef}), unbiasedness of the surrogate
+gradient with the mean-only advantage
+(Section~\ref{sec:theory-unbiased}), and a common-random-numbers
+variance reduction from mask replay
+(Section~\ref{sec:theory-crn}).  The construction admits a Bayesian
+model-average reading throughout, which we comment on inline.
+
+\subsection{Setup}
+\label{sec:theory-setup}
+
+\paragraph{Coconut latent recurrence.}
+Let $f_\theta : \R^d \to \R^d$ denote one Transformer block of a
+latent-reasoning language model with parameters $\theta \in \R^D$.
+Given a prompt $x$, \textsc{Coconut}~\citep{hao2024coconut} produces
+an initial hidden state $h_0 = \mathrm{embed}_\theta(x)$, unrolls $T$
+latent recurrence steps $h_t = f_\theta(h_{t-1})$, then decodes answer
+tokens $y_\ell \sim \pi_\theta(\cdot \mid x, h_T, y_{<\ell})$.  A
+verifier supplies $r(y, x) \in [0,1]$.  Conditional on $\theta$ and
+$x$ the latent phase is deterministic: $K$ independent rollouts
+produce $K$ identical $h_T$ and (under low-temperature decoding)
+$K$ identical answers.
+
+\paragraph{GRPO.}
+For a group of $K$ rollouts under $\theta_\old$ with rewards
+$r^{(k)} = r(y^{(k)}, x)$, the per-rollout advantage is
+$A^{(k)} = r^{(k)} - \mu_r$ with $\mu_r = \tfrac{1}{K}\sum_k r^{(k)}$;
+following~\citet{liu2024drgrpo} we omit the $1/(\sigma_r + \delta)$
+normalization (justified in
+Remark~\ref{rem:sigma}).  The clipped per-token surrogate
+\citep{shao2024deepseekmath} is
+\begin{equation}
+\Loss^{\mathrm{GRPO}}(\theta)
+   \;=\;
+\E_{x \sim \D}
+   \frac{1}{K}\sum_{k=1}^K
+   \frac{1}{|y^{(k)}|}\sum_\ell
+      \min\!\Big(\rho_{\theta,\ell}^{(k)} A^{(k)},\,
+                  \mathrm{clip}(\rho_{\theta,\ell}^{(k)}, 1\pm\eps)\, A^{(k)}\Big)
+   - \beta\,\KL\!\big(\pi_\theta\,\big\|\,\pi_{\mathrm{ref}}\big),
+\label{eq:theory-grpo-loss}
+\end{equation}
+with per-token ratio
+$\rho_{\theta,\ell}^{(k)} = \pi_\theta(y_\ell^{(k)}\!\mid\!\cdot)/\pi_{\theta_\old}(y_\ell^{(k)}\!\mid\!\cdot)$
+and KL anchor $\pi_{\mathrm{ref}}$.
+
+\paragraph{Shared-mask dropout and the augmented policy.}
+Let $H$ index the dropout-affected hidden units.  Drawing
+$\xi \sim p(\xi)$ from a fixed mask distribution that does not depend
+on $\theta$, dropout induces a structured perturbation
+$\tilde\theta(\xi)$ of the network's effective weights with
+$\E_\xi[\tilde\theta(\xi)] = \theta$.  Standard MC dropout draws a
+fresh mask at each layer and step; we instead follow the variational
+construction of~\citet{gal2016dropout} and fix one mask per rollout,
+reused across all $T$ latent steps:
+\begin{equation}
+h_t \;=\; f_{\tilde\theta(\xi)}(h_{t-1}),
+\qquad t = 1, \dots, T,
+\label{eq:theory-perturbed}
+\end{equation}
+so each rollout corresponds to a single posterior sample
+$\tilde\theta(\xi) \sim q_\theta(\theta')$ from a structured
+variational distribution.  The induced policy treats $\xi$ as part of
+the action,
+\begin{equation}
+\Pi_\theta(\xi, y \mid x) \;=\; p(\xi)\,\pi_\theta(y \mid x, \xi),
+\qquad
+\pi_\theta(y \mid x, \xi)
+   \;=\; \prod_\ell \pi_\theta\!\big(y_\ell \,\big|\, x, h_T(\theta, \xi, x), y_{<\ell}\big),
+\label{eq:theory-augmented-policy}
+\end{equation}
+with marginal
+$\bar\pi_\theta(y \mid x) := \E_{\xi}[\pi_\theta(y \mid x, \xi)]
+   = \E_{\theta' \sim q_\theta}[\pi_{\theta'}(y \mid x)]$, the
+Bayesian model-average policy.  We optimize
+$J(\theta) := \E_{x \sim \D}\, \E_{(\xi, y) \sim \Pi_\theta}[r(y, x)]$,
+which by construction equals the expected reward of $\bar\pi_\theta$.
+
+\paragraph{Mask replay.}
+At update time we regenerate $\xi^{(k)}$ from a stored RNG seed and
+recompute $\log \pi_\theta(y^{(k)} \mid x, \xi^{(k)})$ under the
+\emph{same} mask used at rollout time.  This makes $h_T$ at update
+time match its rollout-time value bit-identically when
+$\theta = \theta_\old$, so that
+$\rho_{\theta_\old, \ell}^{(k)} \equiv 1$ exactly.
+
+\subsection{Well-definedness of the latent gradient}
+\label{sec:theory-welldef}
+
+\begin{assumption}\label{ass:smooth}
+For every fixed $\xi$ and almost every $\theta \in \R^D$, the map
+$\theta \mapsto f_{\tilde\theta(\xi)}(h)$ is differentiable in
+$\theta$ for almost every $h$, and the answer-token log-likelihood is
+differentiable in both $\theta$ and $h_T$.
+\end{assumption}
+
+The assumption holds for standard Transformer blocks: the dropout
+rescaling $\theta \mapsto \tilde\theta(\xi)$ is linear in $\theta$ and
+the remaining nonlinearities (LayerNorm, GELU, softmax) are almost
+everywhere differentiable.
+
+\begin{lemma}[Well-defined latent gradient]
+\label{lem:induction}
+Under Assumption~\ref{ass:smooth}, for every $T \ge 0$ and every
+$\xi$, the Jacobian $\partial h_T / \partial \theta$ exists almost
+everywhere and is given by the recursion
+\begin{equation}
+\frac{\partial h_t}{\partial \theta}
+   \;=\;
+\frac{\partial f_{\tilde\theta}}{\partial \tilde\theta}\bigg|_{h_{t-1}}
+   \cdot \frac{\partial \tilde\theta}{\partial \theta}
+   \;+\;
+\frac{\partial f_{\tilde\theta}}{\partial h}\bigg|_{h_{t-1}}
+   \cdot \frac{\partial h_{t-1}}{\partial \theta},
+\qquad
+\frac{\partial h_0}{\partial \theta}
+   \;=\;
+\frac{\partial \mathrm{embed}_\theta(x)}{\partial \theta},
+\label{eq:theory-jacobian}
+\end{equation}
+so $\nabla_\theta \log \pi_\theta(y \mid x, \xi)$ is well defined
+almost everywhere.
+\end{lemma}
+
+The proof is induction on $t$ via the multivariate chain rule applied
+to $h_t = f(\tilde\theta, h_{t-1})$; both terms exist by
+Assumption~\ref{ass:smooth} and the inductive hypothesis.  The
+recursion~\eqref{eq:theory-jacobian} is what
+\texttt{loss.backward()} computes when the dropout mask is held
+constant via RNG-state restoration: PyTorch's
+\texttt{torch.nn.functional.dropout} treats the mask as a constant
+during backprop, so
+$\partial \tilde\theta / \partial \theta$ is the structured
+Bernoulli-rescaled identity exactly.
+
+\subsection{Unbiasedness of the surrogate gradient}
+\label{sec:theory-unbiased}
+
+\begin{theorem}[Unbiased policy-surrogate gradient]
+\label{thm:unbiased}
+Treat the $K$ rollouts as i.i.d.\ draws from
+$\Pi_{\theta_\old}(\cdot \mid x)$ and define the policy-surrogate
+component
+$\Loss^{\mathrm{surr}} := \Loss^{\mathrm{GRPO}} + \beta \KL$.  Under
+$A^{(k)} = r^{(k)} - \mu_r$ and mask replay,
+\begin{equation}
+\nabla_\theta \Loss^{\mathrm{surr}}(\theta)\Big|_{\theta = \theta_\old}
+   \;=\;
+\Big(1 - \tfrac{1}{K}\Big)\,\nabla_\theta J(\theta)\Big|_{\theta_\old}.
+\label{eq:theory-unbiased}
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+At $\theta = \theta_\old$, mask replay yields
+$\rho_{\theta_\old, \ell}^{(k)} \equiv 1$, the PPO clip is inactive,
+and the surrogate gradient reduces to the unclipped product.  Writing
+$s^{(k)} := \nabla_\theta \log \pi_\theta(y^{(k)} \mid x, \xi^{(k)})|_{\theta_\old}$,
+\[
+\nabla_\theta \Loss^{\mathrm{surr}}\big|_{\theta_\old}
+   \;=\;
+\E\!\left[\frac{1}{K}\sum_k (r^{(k)} - \mu_r)\, s^{(k)}\right].
+\]
+For $j \ne k$, independence and the zero-mean property of the score
+function give
+$\E[r^{(j)} s^{(k)}] = \E[r^{(j)}]\,\E[s^{(k)}] = 0$, so
+$\E[\mu_r\, s^{(k)}] = \tfrac{1}{K}\E[r^{(k)}\, s^{(k)}]$ and
+\(
+\E[(r^{(k)} - \mu_r)\, s^{(k)}] = (1 - \tfrac{1}{K})\,\E[r^{(k)}\, s^{(k)}].
+\)
+The right-hand side is the standard REINFORCE policy gradient on
+$\Pi_\theta$, which by the definition of $\bar\pi_\theta$ equals
+$\nabla J(\theta)|_{\theta_\old}$.
+\end{proof}
+
+\begin{corollary}[Optimization on the marginal policy]
+\label{cor:marginal}
+The estimator targets $\nabla J(\theta)$, the expected reward of the
+Bayesian model-average policy $\bar\pi_\theta$
+\eqref{eq:theory-augmented-policy}.  The shared-mask construction
+turns dropout-GRPO into ensemble-aware policy optimization: each
+gradient step is a Monte Carlo average of per-ensemble-member policy
+gradients, with the group mean serving as a control variate.
+\end{corollary}
+
+\begin{remark}[Why $\sigma_r$ is dropped]
+\label{rem:sigma}
+The original GRPO advantage
+$(r^{(k)} - \mu_r)/(\sigma_r + \delta)$ couples $s^{(k)}$ to every
+$r^{(j)}$ via a nonlinear function of all rewards; the factorization
+$\E[r^{(j)} s^{(k)}] = \E[r^{(j)}]\E[s^{(k)}]$ used above breaks and
+the estimator is biased.  \citet{liu2024drgrpo} report that this bias
+overweights low-variance prompts and underweights high-variance ones;
+we drop $\sigma_r$ throughout.
+\end{remark}
+
+\subsection{Variance reduction via mask replay}
+\label{sec:theory-crn}
+
+Two unbiased estimators of $\nabla J(\theta_\old + \Delta)$ for small
+$\Delta$ are available: the \emph{mask-replay} (CRN) estimator
+$\hat g_{\mathrm{CRN}}(\theta;\xi,y) := A(\xi,y)\,\nabla_\theta \log \pi_\theta(y \mid x, \xi)$,
+which reuses the rollout-time $(\xi, y)$, and the \emph{fresh-rollout}
+estimator $\hat g_{\mathrm{fresh}}(\theta;\xi',y')$ obtained by
+drawing $(\xi', y') \sim \Pi_{\theta_\old}(\cdot \mid x)$ at update
+time and recomputing the advantage from a fresh group.
+
+\begin{proposition}[CRN coupling]
+\label{prop:crn}
+Both estimators are unbiased for $\nabla J(\theta)$ at
+$\theta = \theta_\old$ (modulo the $(1 - 1/K)$ scale of
+Theorem~\ref{thm:unbiased}).  Suppose
+$\theta \mapsto A(\xi, y)\,\nabla \log \pi_\theta(y \mid x, \xi)$ is
+$L$-Lipschitz $\Pi_{\theta_\old}$-a.s.  Then in the trust-region
+regime $\|\Delta\| \to 0$ the two estimators have matching leading-order
+variance, while the fresh-rollout estimator carries an additional
+across-call resampling-variance term that the mask-replay estimator
+eliminates by construction.
+\end{proposition}
+
+\begin{proof}[Sketch]
+Decompose each estimator as a value at $\theta_\old$ plus a Lipschitz
+perturbation; the zero-order distributions coincide because both
+$(\xi, y)$ and $(\xi', y')$ are drawn from
+$\Pi_{\theta_\old}(\cdot \mid x)$.  The fresh-rollout estimator pays
+an additional independent-resampling variance contribution at every
+update-time evaluation, which CRN's reuse of $(\xi, y)$ removes.  This
+is the standard CRN argument
+(\citealp{glasserman1992crn}, Thm.~3.1) specialized to a score-function
+estimator coupled across $\theta$ values via shared exogenous noise.
+\end{proof}
+
+In the practical PPO setting where $\|\theta - \theta_\old\|$ is small
+under the clip and $E$ mini-epochs of updates are taken per rollout
+batch, the coupling is the dominant variance reduction.

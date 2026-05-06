@@ -52,3 +52,25 @@
     - 29.42% let's goooo!!!!
 
 - Will try running on different seeds next
+
+2026/05/04
+- For paper, try to do the following
+1. Eval on SVAMP/ASDiv/MultiArith, to empirically prove that GRPO'd model isn't overfitting, but generalizing across different distribution landscapes
+2. 3 different runs to prove it's not a fluke (123 base run, 124 currently running, 125 need to be run - maybe on A100)
+3. Ablation testing on Coconut + REINFORCE
+4. Ablation testing on Coconut + temperature sampling
+
+5. (Maybe) finetune on openmath-R1-220k, then test on MATH500
+
+Next step: language-based cot internalization?
+
+2026/05/05
+Checklist for NeurIPS:
+1. Add checklist to paper
+2. Zip up code
+3. Check for page limit of 9
+
+
+PLAN
+5/5: Put together paper, should be 80~90% ready
+5/6: Finishing touches, diagram, tables, ablation tests, checklist, code zip & submit, LLM feedback, references checking

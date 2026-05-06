@@ -1,0 +1,43 @@
+% =====================================================================
+% Sample abstract for the dropout-GRPO paper.
+% Standalone .tex fragment; assumes the same preamble as
+% research_draft_revised.tex.
+% =====================================================================
+
+\begin{abstract}
+Group Relative Policy Optimization (GRPO) has become the standard
+reinforcement-learning recipe for fine-tuning reasoning language models,
+but it relies on a hidden assumption: the $K$ rollouts in each group
+must differ, or the group-mean advantage $A^{(k)} = r^{(k)} - \mu_r$
+collapses to zero.  Latent-reasoning models such as \textsc{Coconut},
+which feed continuous hidden states recurrently in place of discrete
+chain-of-thought tokens, violate this assumption --- conditional on the
+parameters and prompt, the latent phase is deterministic, so all $K$
+rollouts produce identical trajectories and GRPO makes no progress.
+
+We propose to source the missing stochasticity from \emph{dropout}.
+Each rollout is run with one Bernoulli mask drawn afresh and held
+constant across all latent recurrence steps (variational dropout in the
+sense of Gal \& Ghahramani, 2016); the mask is recorded and replayed
+during the policy update, so the trajectory that was graded is
+reproduced bit-identically.  We prove that, under the mean-only
+advantage $A^{(k)} = r^{(k)} - \mu_r$ (without standard-deviation
+normalization, following Liu et al., 2024), the resulting surrogate
+gradient equals $(1 - 1/K)\,\nabla J(\theta)$ exactly, with $J$ the
+expected reward of the mask-marginalized policy --- which is itself a
+Bayesian model average over the variational dropout posterior.  Mask
+replay further provides a common-random-numbers coupling that
+lower-bounds the variance of a fresh-rollout estimator throughout the
+PPO trust region.
+
+We document four implementation refinements that prove necessary in
+practice: a Huberized $k_3$ KL estimator with bounded but nonzero tail
+gradient, a learning-rate-coupled annealing of the KL coefficient,
+sequence-mean rather than token-mean loss aggregation, and a group-level
+accuracy filter that drops uninformative groups before any backward
+pass and acts as an emergent online curriculum.  On math-reasoning
+fine-tuning, dropout-GRPO with mask replay trains stably where the
+deterministic-rollout baseline does not, and we release a reference
+implementation that realizes bit-identical mask replay across the entire
+latent recurrence.
+\end{abstract}

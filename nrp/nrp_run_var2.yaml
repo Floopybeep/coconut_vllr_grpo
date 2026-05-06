@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: train-run2
+  namespace: wcsng-log
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      
+      containers:
+      - name: train-run2
+        image: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime 
+          
+        command: 
+        - "/bin/bash"
+        - "-c"
+        - |
+          # Keep your debug logging! It's great for catching other errors.
+          exec > /workspace/startup_log_${HOSTNAME}.txt 2>&1
+
+          echo "Activating virtual environment..."
+          source /workspace/.venv/bin/activate
+
+          # 1. Navigate to your working directory
+          cd /workspace/coconut_dropout
+          
+          # 2. Launch the single WandB agent for this specific pod
+          echo "Starting Training..."
+          torchrun --nnodes 1 --nproc_per_node 1 run_grpo_dropout_variational.py args/gsm_dropout2.yaml
+        
+        resources:
+          limits:
+            nvidia.com/a100: "1"   # Correctly requesting the special resource
+            memory: "32Gi"        
+            cpu: "16"             
+          requests:
+            nvidia.com/a100: "1"   # Correctly requesting the special resource
+            memory: "32Gi"        
+            cpu: "16"             
+            
+        volumeMounts:
+        - name: storage-volume
+          mountPath: /workspace
+          
+      volumes:
+      - name: storage-volume
+        persistentVolumeClaim:
+          claimName: train-pvc
